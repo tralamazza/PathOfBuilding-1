@@ -76,6 +76,8 @@ local function sanitizeValue(value, state, depth)
 		return nil
 	end
 	state.seen[value] = true
+	local metadata = getmetatable(value)
+	local declaredType = metadata and metadata.__jsontype
 	local output
 	if M.isArray(value) then
 		output = {}
@@ -99,6 +101,9 @@ local function sanitizeValue(value, state, depth)
 			output[outputKey] = sanitizeValue(entry, state, depth + 1)
 			count = count + 1
 		end
+	end
+	if declaredType then
+		setmetatable(output, { __jsontype = declaredType })
 	end
 	state.seen[value] = nil
 	return output
@@ -164,6 +169,11 @@ end
 
 function M.summaryLine(err)
 	local message = M.errorMessage(err)
+	message = message:gsub("\nstack traceback:.*$", "")
+	message = message:gsub("^%s*Error:%s*", "")
+	message = message:gsub("\nv[%d%.]+[^\n]*", "")
+	message = message:gsub("\nPress Enter/Escape.*$", "")
+	message = M.trim(message)
 	local firstLine = message:match("^[^\n]+") or message
 	return firstLine
 end

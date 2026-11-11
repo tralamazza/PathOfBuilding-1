@@ -1,5 +1,4 @@
 local json = require("mcp.json")
-local util = require("engine.util")
 
 local M = {}
 
@@ -14,12 +13,15 @@ local function writeResponse(server, response)
 end
 
 local function handleDecoded(server, decoded)
-	if type(decoded) ~= "table" then
-		local response = server:errorResponse(nil, -32600, "Invalid Request")
-		writeResponse(server, response)
+	if type(decoded) ~= "table" or decoded == json.null then
+		writeResponse(server, server:errorResponse(nil, -32600, "Invalid Request"))
 		return
 	end
-	if util.isArray(decoded) then
+	if json.isArray(decoded) then
+		if not server:batchAllowed() then
+			writeResponse(server, server:errorResponse(nil, -32600, "Batch requests are not supported by the negotiated MCP version"))
+			return
+		end
 		if #decoded == 0 then
 			writeResponse(server, server:errorResponse(nil, -32600, "Invalid Request"))
 			return
@@ -52,7 +54,7 @@ function M.run(server)
 		line = line:gsub("\r$", "")
 		if line:match("%S") then
 			local decoded, err = json.decode(line)
-			if not decoded then
+			if decoded == nil then
 				writeResponse(server, server:errorResponse(nil, -32700, "Parse error: " .. tostring(err)))
 			else
 				handleDecoded(server, decoded)

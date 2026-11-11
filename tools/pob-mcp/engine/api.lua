@@ -3,6 +3,13 @@ local codec = require("engine.codec")
 
 local M = {}
 
+local function objectMap(value)
+	if type(value) == "table" then
+		setmetatable(value, { __jsontype = "object" })
+	end
+	return value
+end
+
 local Api = {}
 Api.__index = Api
 
@@ -50,6 +57,22 @@ local curatedStatKeys = {
 	"Cooldown",
 }
 
+local groupSlots = {
+	["Weapon 1"] = true,
+	["Weapon 2"] = true,
+	["Weapon 1 Swap"] = true,
+	["Weapon 2 Swap"] = true,
+	["Helmet"] = true,
+	["Body Armour"] = true,
+	["Gloves"] = true,
+	["Boots"] = true,
+	["Amulet"] = true,
+	["Ring 1"] = true,
+	["Ring 2"] = true,
+	["Ring 3"] = true,
+	["Belt"] = true,
+}
+
 function M.new(env)
 	local self = setmetatable({}, Api)
 	self.env = env
@@ -66,7 +89,22 @@ function Api:checkPrompt()
 	local message = self.env.launch.promptMsg
 	if message then
 		self.env.launch.promptMsg = nil
-		error(util.stripColors(message), 0)
+		message = util.stripColors(message)
+		message = message:gsub("^%s*Error:%s*", "")
+		message = message:gsub("\nv[%d%.]+[^\n]*", "")
+		message = message:gsub("\nPress Enter/Escape.*$", "")
+		error(util.trim(message), 0)
+	end
+	local popups = self.env.main.popups
+	if popups and popups[1] then
+		self.env.main.popups = {}
+		error("PoB blocked the operation with a dialog; the build may require conversion", 0)
+	end
+end
+
+function Api:checkBuildInitialized(build)
+	if not build.targetVersion then
+		error("Build requires conversion; import with convert=true", 0)
 	end
 end
 
@@ -75,6 +113,10 @@ function Api:frame()
 	build.buildFlag = true
 	self.env.runCallback("OnFrame")
 	self:checkPrompt()
+	self:checkBuildInitialized(build)
+	if build.itemsTab and build.itemsTab.UpdateSockets then
+		build.itemsTab:UpdateSockets()
+	end
 	return build
 end
 
@@ -304,7 +346,7 @@ function Api:summary()
 		tree_version = build.spec.treeVersion,
 		points = self:points(build),
 		main_skill = self:mainSkillInfo(build),
-		stats = self:curatedStats(build.calcsTab.mainOutput or {}),
+		stats = objectMap(self:curatedStats(build.calcsTab.mainOutput or {})),
 		warnings = self:warnings(build),
 		item_count = build.itemsTab and #build.itemsTab.itemOrderList or 0,
 		skill_group_count = build.skillsTab and #build.skillsTab.socketGroupList or 0,
@@ -351,7 +393,6 @@ function Api:newBuild(options)
 	self.env.runCallback("OnFrame")
 	self:checkPrompt()
 	local build = self:getBuild()
-	build.characterLevelAutoMode = false
 	self:applyCharacter(build, options)
 	self:frame()
 	return self:summary()
@@ -362,8 +403,7 @@ function Api:loadXML(xml, name, convert)
 		error("Build XML is empty", 0)
 	end
 	self.env.main:SetMode("BUILD", false, name or "Imported Build", xml, convert ~= false)
-	self.env.runCallback("OnFrame")
-	self:checkPrompt()
+	self:frame()
 	return self:summary()
 end
 
@@ -389,7 +429,23 @@ function Api:importBuild(options)
 	if not xml then
 		error("build_import requires xml, code, or path", 0)
 	end
-	return self:loadXML(xml, options.name, options.convert)
+	local previousXml
+	local build = self:getBuild()
+	if build and build.SaveDB then
+		local ok, value = pcall(build.SaveDB, build, "previous")
+		if ok then
+			previousXml = value
+		end
+	end
+	local ok, result = pcall(self.loadXML, self, xml, options.name, options.convert)
+	if not ok then
+		if previousXml then
+			self.env.main.popups = {}
+			pcall(self.loadXML, self, previousXml, "Recovered Build", true)
+		end
+		error(result, 0)
+	end
+	return result
 end
 
 function Api:exportBuild(options)
@@ -419,8 +475,15 @@ function Api:exportBuild(options)
 		if not file then
 			error("Could not open export path: " .. tostring(err), 0)
 		end
-		file:write(data)
-		file:close()
+		local written, writeError = file:write(data)
+		if not written then
+			file:close()
+			error("Could not write export path: " .. tostring(writeError), 0)
+		end
+		local closed, closeError = file:close()
+		if not closed then
+			error("Could not close export path: " .. tostring(closeError), 0)
+		end
 	end
 	return {
 		format = format,
@@ -455,7 +518,7 @@ function Api:restore(options)
 	if not name or not self.snapshots[name] then
 		error("Unknown snapshot '" .. tostring(name) .. "'", 0)
 	end
-	return self:loadXML(self.snapshots[name], "Snapshot " .. name, false)
+	return self:importBuild({ xml = self.snapshots[name], name = "Snapshot " .. name, convert = false })
 end
 
 function Api:characterSet(options)
@@ -638,17 +701,28 @@ function Api:resolveNodes(options)
 	if options.names then
 		for _, nameValue in ipairs(options.names) do
 			local target = util.lower(util.trim(tostring(nameValue)))
-			local found
+			local matches = {}
 			for _, node in pairs(build.spec.nodes) do
 				if util.lower(node.dn or node.name or "") == target then
-					found = node
-					break
+					matches[#matches + 1] = node
 				end
 			end
-			if found and not seen[found.id] then
-				seen[found.id] = true
-				nodes[#nodes + 1] = found
-			elseif not found then
+			table.sort(matches, function(a, b)
+				return a.id < b.id
+			end)
+			if #matches > 1 then
+				local ids = {}
+				for _, node in ipairs(matches) do
+					ids[#ids + 1] = tostring(node.id)
+				end
+				errors[#errors + 1] = "Node name '" .. tostring(nameValue) .. "' is ambiguous; use one of these ids: " .. table.concat(ids, ", ")
+			elseif #matches == 1 then
+				local found = matches[1]
+				if not seen[found.id] then
+					seen[found.id] = true
+					nodes[#nodes + 1] = found
+				end
+			else
 				errors[#errors + 1] = "Unknown node name '" .. tostring(nameValue) .. "'"
 			end
 		end
@@ -658,9 +732,20 @@ end
 
 function Api:applyMasteryEffect(node, effectId)
 	local build = self:getBuild()
+	if node.type ~= "Mastery" then
+		error("Node '" .. tostring(node.dn or node.name) .. "' is not a mastery", 0)
+	end
+	if not node.alloc and not node.path then
+		error("Mastery node '" .. tostring(node.dn or node.name) .. "' is unreachable", 0)
+	end
 	local effect = build.spec.tree.masteryEffects[effectId]
 	if not effect then
 		error("Unknown mastery effect '" .. tostring(effectId) .. "'", 0)
+	end
+	for nodeId, selectedEffectId in pairs(build.spec.masterySelections) do
+		if selectedEffectId == effectId and nodeId ~= node.id and build.spec.allocNodes[nodeId] then
+			error("Mastery effect '" .. tostring(effectId) .. "' is already selected at node " .. tostring(nodeId), 0)
+		end
 	end
 	if node.masteryEffects and #node.masteryEffects > 0 then
 		local valid = false
@@ -727,8 +812,8 @@ function Api:passivesAllocate(options)
 	end
 	self:frame()
 	local added = {}
-	for _, node in ipairs(nodes) do
-		if build.spec.allocNodes[node.id] and not before[node.id] then
+	for id, node in pairs(build.spec.allocNodes) do
+		if not before[id] and node.type ~= "ClassStart" and node.type ~= "AscendClassStart" then
 			added[#added + 1] = {
 				id = node.id,
 				name = node.dn or node.name,
@@ -736,6 +821,9 @@ function Api:passivesAllocate(options)
 			}
 		end
 	end
+	table.sort(added, function(a, b)
+		return a.id < b.id
+	end)
 	return {
 		added = added,
 		errors = errors,
@@ -950,6 +1038,9 @@ function Api:skillsAddGroup(options)
 	if type(gems) ~= "table" or #gems == 0 then
 		error("skills_add_group requires a non-empty gems array", 0)
 	end
+	if options.slot and options.slot ~= "" and not groupSlots[options.slot] then
+		error("Unknown skill group slot '" .. tostring(options.slot) .. "'", 0)
+	end
 	local hasActive = false
 	local group = {
 		label = options.label or "",
@@ -1007,8 +1098,15 @@ function Api:skillsRemoveGroup(options)
 	options = options or {}
 	local build = self:getBuild()
 	local groupIndex = tonumber(options.group)
-	if not groupIndex or not build.skillsTab.socketGroupList[groupIndex] then
+	local group = groupIndex and build.skillsTab.socketGroupList[groupIndex]
+	if not group then
 		error("Unknown skill group '" .. tostring(options.group) .. "'", 0)
+	end
+	if group.source then
+		error("Skill groups granted by items cannot be removed", 0)
+	end
+	if build.skillsTab.displayGroup == group then
+		build.skillsTab.displayGroup = nil
 	end
 	table.remove(build.skillsTab.socketGroupList, groupIndex)
 	if build.mainSocketGroup == groupIndex then
@@ -1016,6 +1114,12 @@ function Api:skillsRemoveGroup(options)
 	elseif build.mainSocketGroup and build.mainSocketGroup > groupIndex then
 		build.mainSocketGroup = build.mainSocketGroup - 1
 	end
+	if build.calcsTab.input.skill_number == groupIndex then
+		build.calcsTab.input.skill_number = 1
+	elseif build.calcsTab.input.skill_number and build.calcsTab.input.skill_number > groupIndex then
+		build.calcsTab.input.skill_number = build.calcsTab.input.skill_number - 1
+	end
+	build.skillsTab:RebuildImbuedSupportBySlot()
 	self:frame()
 	return self:skillsGet()
 end
@@ -1173,6 +1277,33 @@ function Api:itemSummary(item)
 	return output
 end
 
+function Api:validateItemSlot(item, slot)
+	local build = self:getBuild()
+	local itemsTab = build.itemsTab
+	itemsTab:UpdateSockets()
+	local slotControl = itemsTab.slots[slot]
+	if not slotControl then
+		local available = {}
+		for _, candidate in ipairs(itemsTab.orderedSlots) do
+			if candidate:IsShown() then
+				available[#available + 1] = candidate.slotName
+			end
+		end
+		error("Unknown item slot '" .. tostring(slot) .. "'. Available slots: " .. table.concat(available, ", "), 0)
+	end
+	if not slotControl:IsShown() then
+		error("Item slot '" .. tostring(slot) .. "' is not currently active", 0)
+	end
+	local nodeId = slot:match("^Jewel (%d+)$")
+	if nodeId and not build.spec.allocNodes[tonumber(nodeId)] then
+		error("Jewel socket " .. nodeId .. " is not allocated", 0)
+	end
+	if not itemsTab:IsItemValidForSlot(item, slot, itemsTab.activeItemSet) then
+		error("Item '" .. tostring(item.name or item.baseName) .. "' cannot be equipped in slot '" .. tostring(slot) .. "'", 0)
+	end
+	return slotControl
+end
+
 function Api:equipItem(item, slot)
 	local build = self:getBuild()
 	local itemsTab = build.itemsTab
@@ -1182,23 +1313,7 @@ function Api:equipItem(item, slot)
 		end
 		slot = item:GetPrimarySlot()
 	end
-	local slotControl = itemsTab.slots[slot]
-	if not slotControl then
-		local available = {}
-		for _, candidate in ipairs(itemsTab.orderedSlots) do
-			if not candidate.inactive then
-				available[#available + 1] = candidate.slotName
-			end
-		end
-		error("Unknown item slot '" .. tostring(slot) .. "'. Available slots: " .. table.concat(available, ", "), 0)
-	end
-	local nodeId = slot:match("^Jewel (%d+)$")
-	if nodeId and not build.spec.allocNodes[tonumber(nodeId)] then
-		error("Jewel socket " .. nodeId .. " is not allocated", 0)
-	end
-	if not itemsTab:IsItemValidForSlot(item, slot, itemsTab.activeItemSet) then
-		error("Item '" .. tostring(item.name or item.baseName) .. "' cannot be equipped in slot '" .. tostring(slot) .. "'", 0)
-	end
+	local slotControl = self:validateItemSlot(item, slot)
 	slotControl:SetSelItemId(item.id)
 	itemsTab:PopulateSlots()
 	return slot
@@ -1212,14 +1327,18 @@ function Api:itemsAddRaw(options)
 	if type(raw) ~= "string" or raw == "" then
 		error("items_add_raw requires raw item text", 0)
 	end
-	itemsTab:CreateDisplayItemFromRaw(raw, true)
+	itemsTab:CreateDisplayItemFromRaw(raw, false)
 	local item = itemsTab.displayItem
 	if not item or not item.base then
 		error("Could not parse item text; check the base item name", 0)
 	end
+	if options.slot and options.slot ~= "" then
+		self:validateItemSlot(item, options.slot)
+	end
 	itemsTab:AddItem(item, true)
 	itemsTab:SetDisplayItem()
 	itemsTab:PopulateSlots()
+	itemsTab:UpdateSockets()
 	local equippedSlot
 	if options.slot and options.slot ~= "" then
 		equippedSlot = self:equipItem(item, options.slot)
@@ -1373,11 +1492,12 @@ function Api:itemsGet(options)
 	options = options or {}
 	local build = self:getBuild()
 	local itemsTab = build.itemsTab
+	itemsTab:UpdateSockets()
 	itemsTab:PopulateSlots()
 	local equipped = {}
 	for _, slot in ipairs(itemsTab.orderedSlots) do
 		local item = itemsTab.items[slot.selItemId]
-		if item then
+		if item and slot:IsShown() then
 			equipped[#equipped + 1] = {
 				slot = slot.slotName,
 				label = slot.label,
@@ -1399,7 +1519,7 @@ function Api:itemsGet(options)
 	end
 	local slots = {}
 	for _, slot in ipairs(itemsTab.orderedSlots) do
-		if not slot.nodeId or build.spec.allocNodes[slot.nodeId] then
+		if slot:IsShown() then
 			slots[#slots + 1] = {
 				name = slot.slotName,
 				label = slot.label,
@@ -1473,7 +1593,7 @@ function Api:configEntries()
 				type = varData.type,
 				section = section,
 				options = options,
-				default = varData.defaultIndex and varData.list and varData.list[varData.defaultIndex] and varData.list[varData.defaultIndex].val or varData.defaultState,
+				default = build.configTab:GetDefaultState(varData.var, type(build.configTab.input[varData.var])),
 				tooltip = type(varData.tooltip) == "string" and util.stripColors(varData.tooltip) or nil,
 				current = build.configTab.input[varData.var],
 			}
@@ -1526,12 +1646,22 @@ function Api:configGet()
 			output[entry.var] = util.sanitize(current)
 		end
 	end
-	local customMods = build.configTab.input.customMods
+	local customMods
+	local configSet = build.configTab.configSets[build.configTab.activeConfigSetId]
+	for _, block in ipairs(configSet.customModsList or {}) do
+		if block.title == "MCP" then
+			customMods = block.text
+			break
+		end
+	end
+	if customMods == nil then
+		customMods = build.configTab.input.customMods
+	end
 	if customMods and customMods ~= "" then
 		output.customMods = customMods
 	end
 	return {
-		set = output,
+		set = objectMap(output),
 	}
 end
 
@@ -1544,6 +1674,7 @@ function Api:configSet(options)
 		vars[entry.var] = entry
 	end
 	local changed = {}
+	local coerced = {}
 	for key, value in pairs(values) do
 		local entry = vars[key]
 		if not entry then
@@ -1575,8 +1706,13 @@ function Api:configSet(options)
 			end
 			value = matched
 		else
-			value = tostring(value)
+			if type(value) ~= "string" then
+				error("Config option '" .. key .. "' expects a string", 0)
+			end
 		end
+		coerced[key] = value
+	end
+	for key, value in pairs(coerced) do
 		build.configTab.input[key] = value
 		changed[key] = value
 	end
@@ -1598,10 +1734,11 @@ function Api:configSet(options)
 		build.configTab.input.customMods = block.text
 		changed.customMods = block.text
 	end
+	build.configTab:UpdateControls()
 	build.configTab:BuildModList()
 	self:frame()
 	return {
-		changed = util.sanitize(changed),
+		changed = objectMap(util.sanitize(changed)),
 		config = self:configGet(),
 		summary = self:summary(),
 	}
@@ -1613,10 +1750,10 @@ function Api:calcStats(options)
 	local output = build.calcsTab.mainOutput or {}
 	local result = {
 		main_skill = self:mainSkillInfo(build),
-		stats = self:curatedStats(output),
+		stats = objectMap(self:curatedStats(output)),
 	}
 	if options.stats then
-		result.requested = {}
+		result.requested = objectMap({})
 		result.missing = {}
 		for _, key in ipairs(options.stats) do
 			local value = output[key]
@@ -1628,15 +1765,15 @@ function Api:calcStats(options)
 		end
 	end
 	if options.all then
-		result.all = util.sanitize(output, { depth = 4, maxKeys = 800, maxArray = 2000 })
+		result.all = objectMap(util.sanitize(output, { depth = 4, maxKeys = 800, maxArray = 2000 }))
 	end
 	if options.include_minion then
 		local minion = build.calcsTab.mainEnv and build.calcsTab.mainEnv.minion
 		if minion then
 			result.minion = {
 				name = minion.minionData and minion.minionData.name,
-				stats = self:curatedStats(minion.output or {}),
-				all = options.all and util.sanitize(minion.output or {}, { depth = 4, maxKeys = 800, maxArray = 2000 }) or nil,
+				stats = objectMap(self:curatedStats(minion.output or {})),
+				all = options.all and objectMap(util.sanitize(minion.output or {}, { depth = 4, maxKeys = 800, maxArray = 2000 })) or nil,
 			}
 		end
 	end

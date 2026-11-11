@@ -39,12 +39,18 @@ package.path = table.concat({
 }, ";")
 
 local Engine = require("engine.init")
+local mcpJson = require("mcp.json")
+local userPath = os.getenv("POB_MCP_USER_PATH")
+local temporaryUserPath = not userPath
+if not userPath then
+	userPath = os.tmpname() .. ".pob-mcp"
+end
 
 local options = {
 	root = root,
 	src = root .. "/src",
 	runtime = runtime,
-	userPath = (os.getenv("HOME") or root) .. "/.pob-mcp",
+	userPath = userPath,
 }
 
 local api = Engine.get(options)
@@ -124,7 +130,7 @@ test("passives_search_allocate", function()
 	local before = api:passivesGet().points.used
 	local result = api:passivesAllocate({ names = { "Deep Wisdom" } })
 	assertEqual(#result.errors, 0)
-	assertTrue(#result.added >= 1, "expected allocated nodes")
+	assertTrue(#result.added >= 2, "expected the notable and its path nodes")
 	assertTrue(result.points.used > before, "expected more points used")
 	local state = api:passivesGet()
 	local found = false
@@ -167,6 +173,32 @@ test("passive_mastery", function()
 	end
 end)
 
+test("mastery_validation", function()
+	local normal = api:passivesSearch({ type = "normal", allocated = false, reachable = true, limit = 1 })
+	assertTrue(normal.total > 0, "expected an unallocated normal node")
+	local result = api:passivesAllocate({
+		ids = { normal.nodes[1].id },
+		mastery_effects = { [tostring(normal.nodes[1].id)] = 1 },
+	})
+	assertEqual(#result.errors, 1)
+	assertTrue(result.errors[1]:find("not a mastery", 1, true) ~= nil, "expected a non-mastery error")
+	local build = api:getBuild()
+	local unreachable
+	for _, node in pairs(build.spec.nodes) do
+		if node.type == "Mastery" and not node.alloc and not node.path and node.masteryEffects and #node.masteryEffects > 0 then
+			unreachable = node
+			break
+		end
+	end
+	if unreachable then
+		local ok = pcall(function()
+			api:passivesSetMastery({ node_id = unreachable.id, effect_id = unreachable.masteryEffects[1].id })
+		end)
+		assertTrue(not ok, "unreachable mastery should fail")
+		assertTrue(build.spec.masterySelections[unreachable.id] == nil, "unreachable mastery should not be mutated")
+	end
+end)
+
 test("items_add_unique", function()
 	local search = api:itemsSearchUniques({ query = "Abyssus", limit = 5 })
 	assertTrue(search.total > 0, "expected Abyssus")
@@ -186,6 +218,8 @@ test("items_add_unique", function()
 	end
 	assertTrue(raw and raw:find("Selected Variant: 1", 1, true), "expected selected variant line")
 	assertTrue(raw and raw:find("Sockets: B-B", 1, true), "expected sockets line")
+	local zeroQuality = api:itemsAddUnique({ name = "Abyssus", quality = 0, equip = false })
+	assertEqual(zeroQuality.quality, 0)
 end)
 
 test("items_add_rare_and_equip", function()
@@ -234,15 +268,29 @@ test("items_add_and_equip_jewel", function()
 		end
 	end
 	assertTrue(found ~= nil and found.raw and found.raw:find("Cobalt Jewel", 1, true), "expected jewel raw text")
+	api:passivesDeallocate({ ids = { socketNode.id } })
+	local after = api:itemsGet({})
+	for _, entry in ipairs(after.equipped) do
+		assertTrue(entry.slot ~= slot, "deallocated jewel socket should not appear equipped")
+	end
 end)
 
 test("config_set", function()
+	local initial = api:configGet()
+	assertTrue(next(initial.set) == nil, "fresh build should not report default config values")
+	local encodedInitial = mcpJson.encode(initial)
+	assertTrue(encodedInitial:find('"set":{}', 1, true) ~= nil, "empty config set must encode as an object")
 	local search = api:configSearch({ query = "onslaught", limit = 5 })
 	assertTrue(search.total > 0, "expected Onslaught option")
 	local result = api:configSet({ values = { buffOnslaught = true } })
 	assertEqual(result.config.set.buffOnslaught, true)
 	local fetched = api:configGet()
 	assertEqual(fetched.set.buffOnslaught, true)
+	local ok = pcall(function()
+		api:configSet({ values = { conditionMoving = true, definitelyNotAConfigOption = true } })
+	end)
+	assertTrue(not ok, "invalid config set should fail")
+	assertTrue(api:configGet().set.conditionMoving == nil, "failed config set must not partially mutate")
 	local beforeLife = api:calcStats({ stats = { "Life" } }).requested.Life
 	api:configSet({ custom_mods = "+100 to maximum Life" })
 	local afterLife = api:calcStats({ stats = { "Life" } }).requested.Life
@@ -273,6 +321,7 @@ test("snapshot_restore", function()
 	assertTrue(api:passivesGet().points.used > before, "expected allocation to add points")
 	api:restore({ name = "before-extra-node" })
 	assertEqual(api:passivesGet().points.used, before)
+	assertEqual(api:configGet().set.customMods, "+100 to maximum Life")
 end)
 
 test("build_code_roundtrip", function()
@@ -288,6 +337,19 @@ test("build_code_roundtrip", function()
 	assertNear(after.Life, before.Life, 0.0001, "Life changed after round-trip")
 	local fromXML = api:importBuild({ xml = xml.data, name = "From XML" })
 	assertEqual(fromXML.name, "From XML")
+	local beforeLegacy = api:calcStats({ stats = { "TotalDPS", "Life" } }).requested
+	local legacyOk, legacyError = pcall(function()
+		api:importBuild({
+			xml = '<PathOfBuilding><Build level="1" className="Witch"/></PathOfBuilding>',
+			name = "Legacy",
+			convert = false,
+		})
+	end)
+	assertTrue(not legacyOk, "legacy import without convert should fail")
+	assertTrue(tostring(legacyError):find("conversion", 1, true) ~= nil or tostring(legacyError):find("dialog", 1, true) ~= nil, "expected a conversion error")
+	local afterLegacy = api:calcStats({ stats = { "TotalDPS", "Life" } }).requested
+	assertNear(afterLegacy.TotalDPS, beforeLegacy.TotalDPS, 0.0001, "build was not restored after failed import")
+	assertNear(afterLegacy.Life, beforeLegacy.Life, 0.0001, "build was not restored after failed import")
 	local path = os.tmpname()
 	local written = api:exportBuild({ format = "code", path = path })
 	assertEqual(written.path, path)
@@ -358,7 +420,29 @@ test("invalid_requests", function()
 		api:itemsAddRare({ base = "Definitely Not A Base" })
 	end)
 	assertTrue(not okBase, "expected unknown base to fail")
+	local okDuplicate, duplicateError = pcall(function()
+		api:passivesAllocate({ names = { "Spell Damage" } })
+	end)
+	assertTrue(not okDuplicate and tostring(duplicateError):find("ambiguous", 1, true) ~= nil, "expected duplicate names to be rejected")
+	local beforeItems = #api:itemsGet({}).items
+	local okSlot = pcall(function()
+		api:itemsAddRaw({ raw = "Rarity: Normal\nCoral Ring", slot = "Not A Slot" })
+	end)
+	assertTrue(not okSlot, "expected invalid slot to fail")
+	assertEqual(#api:itemsGet({}).items, beforeItems)
+	local okRing3 = pcall(function()
+		api:itemsAddRaw({
+			raw = "Rarity: Rare\nTest Ring\nCoral Ring\nImplicits: 0\n+10 to maximum Life",
+			slot = "Ring 3",
+		})
+	end)
+	assertTrue(not okRing3, "expected inactive Ring 3 to fail")
+	assertEqual(#api:itemsGet({}).items, beforeItems)
 end)
+
+if temporaryUserPath then
+	os.remove(userPath)
+end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passed, failed))
 if failed > 0 then

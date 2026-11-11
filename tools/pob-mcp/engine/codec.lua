@@ -10,6 +10,8 @@ int compress2(unsigned char *dest, unsigned long *destLen, const unsigned char *
 int uncompress(unsigned char *dest, unsigned long *destLen, const unsigned char *source, unsigned long sourceLen);
 ]])
 
+local maximumBuildSize = 64 * 1024 * 1024
+
 local zlib
 local zlibError
 
@@ -47,6 +49,9 @@ function M.compress(data)
 		return nil, zlibError
 	end
 	local sourceLength = #data
+	if sourceLength > maximumBuildSize then
+		return nil, "Build data exceeds the maximum supported size"
+	end
 	local bound = tonumber(library.compressBound(sourceLength))
 	if not bound or bound <= 0 then
 		return nil, "compressBound failed"
@@ -65,8 +70,11 @@ function M.decompress(data)
 	if not library then
 		return nil, zlibError
 	end
-	local outputLength = #data * 8 + 256
-	for _ = 1, 12 do
+	if #data > maximumBuildSize then
+		return nil, "Build code exceeds the maximum supported size"
+	end
+	local outputLength = math.min(#data * 8 + 256, maximumBuildSize)
+	while true do
 		local buffer = ffi.new("unsigned char[?]", outputLength)
 		local length = ffi.new("unsigned long[1]", outputLength)
 		local result = library.uncompress(buffer, length, ffi.cast("const unsigned char*", data), #data)
@@ -75,9 +83,11 @@ function M.decompress(data)
 		elseif result ~= -5 then
 			return nil, "uncompress failed with code " .. tostring(result)
 		end
-		outputLength = outputLength * 4
+		if outputLength >= maximumBuildSize then
+			return nil, "Decompressed build exceeds the maximum supported size"
+		end
+		outputLength = math.min(outputLength * 4, maximumBuildSize)
 	end
-	return nil, "Unable to decompress build code"
 end
 
 function M.encodeBuildCode(xml)
@@ -95,6 +105,9 @@ function M.decodeBuildCode(code)
 		return nil, "Build code must be a string"
 	end
 	code = code:gsub("%s+", "")
+	if #code > maximumBuildSize * 2 then
+		return nil, "Build code exceeds the maximum supported size"
+	end
 	code = code:gsub("-", "+"):gsub("_", "/")
 	local remainder = #code % 4
 	if remainder > 0 then

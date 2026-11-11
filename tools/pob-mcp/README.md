@@ -119,6 +119,10 @@ Node ids are specific to the current tree version. Search results include `path_
 
 Use `build_snapshot` before trying alternatives and `build_restore` to return.
 
+## Security and trust
+
+This is a local stdio tool intended for a trusted MCP client. It can read and write files when an import or export path is supplied, so do not expose it to untrusted callers. It does not execute arbitrary Lua from builds, but if path access needs to be constrained, run it in a container or add an allowlist in front of the import/export handlers.
+
 ## Notes
 
 - One MCP server process owns one active build. Use snapshots for alternatives.

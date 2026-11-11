@@ -30,11 +30,12 @@ local toolRoot = dirname(testDir)
 local root = dirname(dirname(toolRoot))
 local runtime = root .. "/runtime"
 
-package.path = runtime .. "/lua/?.lua;" .. runtime .. "/lua/?/init.lua;" .. package.path
-local json = require("dkjson")
+package.path = toolRoot .. "/?.lua;" .. toolRoot .. "/?/init.lua;" .. runtime .. "/lua/?.lua;" .. runtime .. "/lua/?/init.lua;" .. package.path
+local json = require("mcp.json")
 
 local luajit = os.getenv("POB_MCP_LUAJIT") or "luajit"
 local mainScript = toolRoot .. "/main.lua"
+local userPath = os.getenv("POB_MCP_USER_PATH") or (os.tmpname() .. ".pob-mcp")
 
 local function shellQuote(value)
 	return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
@@ -54,23 +55,33 @@ local function runServer(requests, label)
 	local errorPath = os.tmpname()
 	writeRequests(requestPath, requests)
 	local command = table.concat({
+		"POB_MCP_USER_PATH=" .. shellQuote(userPath),
 		shellQuote(luajit),
 		shellQuote(mainScript),
 		"< " .. shellQuote(requestPath),
 		"> " .. shellQuote(outputPath),
 		"2> " .. shellQuote(errorPath),
 	}, " ")
-	local ok = os.execute(command)
+	local status = os.execute(command)
 	local responses = {}
 	local responseList = {}
+	local function addResponse(decoded)
+		responseList[#responseList + 1] = decoded
+		if type(decoded.id) == "string" or type(decoded.id) == "number" then
+			responses[tostring(decoded.id)] = decoded
+		end
+	end
 	local output = assert(io.open(outputPath, "rb"))
 	for line in output:lines() do
 		if line:match("%S") then
 			local decoded, err = json.decode(line)
-			assert(decoded, "invalid JSON response in " .. label .. ": " .. tostring(err) .. "\n" .. line)
-			responseList[#responseList + 1] = decoded
-			if decoded.id ~= nil then
-				responses[tostring(decoded.id)] = decoded
+			assert(decoded ~= nil, "invalid JSON response in " .. label .. ": " .. tostring(err) .. "\n" .. line)
+			if json.isArray(decoded) then
+				for _, entry in ipairs(decoded) do
+					addResponse(entry)
+				end
+			else
+				addResponse(decoded)
 			end
 		end
 	end
@@ -83,7 +94,7 @@ local function runServer(requests, label)
 	os.remove(requestPath)
 	os.remove(outputPath)
 	os.remove(errorPath)
-	assert(ok, "server failed for " .. label .. "\n" .. stderr)
+	assert(status == true or status == 0, "server failed for " .. label .. "\n" .. stderr)
 	return responses, responseList, stderr
 end
 
@@ -100,7 +111,7 @@ local function toolResult(response, label)
 	return decoded, false
 end
 
-local initialize = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}'
+local initialize = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"pob-mcp-test","version":"1"}}}'
 local initialized = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
 local requests = {
@@ -119,6 +130,14 @@ local requests = {
 	'{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"missing_tool","arguments":{}}}',
 	'{"jsonrpc":"2.0","id":13,"method":"unknown/method"}',
 	'{"jsonrpc":"2.0","id":14,"method":"ping"}',
+	'{"jsonrpc":"2.0","id":15,"method":"tools/call","params":1}',
+	'{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"build_new","arguments":{"level":200}}}',
+	'{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"build_new","arguments":false}}',
+	'{"jsonrpc":"2.0","id":18,"method":"ping"} trailing',
+	'{"jsonrpc":"2.0","id":19,"method":"ping",}',
+	'false',
+	'null',
+	'[null,{"jsonrpc":"2.0","id":20,"method":"ping"}]',
 	'not valid json',
 }
 
@@ -149,19 +168,50 @@ local exported, exportError = toolResult(responses["10"], "build_export")
 assert(not exportError, "build_export failed")
 assert(type(exported.data) == "string" and #exported.data > 0, "expected a build code")
 
-local missing, missingError = toolResult(responses["12"], "missing_tool")
-assert(missingError == true, "missing tool should be an error")
-assert(type(missing) == "string", "missing tool should return text")
+assert(responses["12"].error and responses["12"].error.code == -32602, "unknown tool should be -32602")
 assert(responses["13"].error and responses["13"].error.code == -32601, "expected method not found")
 assert(responses["14"].result ~= nil, "ping failed")
+assert(responses["15"].error and responses["15"].error.code == -32602, "non-object params should be -32602")
+assert(responses["16"].error and responses["16"].error.code == -32602, "schema violation should be -32602")
+assert(responses["17"].error and responses["17"].error.code == -32602, "non-object arguments should be -32602")
+assert(responses["20"] and responses["20"].result ~= nil, "null batch element should not drop ping")
 local parseErrorFound = false
+local invalidRequestCount = 0
+local nullIdFound = false
 for _, response in ipairs(responseList) do
 	if response.error and response.error.code == -32700 then
 		parseErrorFound = true
+		if response.id == json.null then
+			nullIdFound = true
+		end
+	elseif response.error and response.error.code == -32600 then
+		invalidRequestCount = invalidRequestCount + 1
 	end
 end
 assert(parseErrorFound, "expected parse error response")
+assert(nullIdFound, "parse errors must include id:null")
+assert(invalidRequestCount >= 2, "expected invalid request responses for false/null")
 io.stdout:write("PASS stdio first session\n")
+
+local uninitialized = runServer({
+	'{"jsonrpc":"2.0","id":1,"method":"ping"}',
+}, "uninitialized")
+assert(uninitialized["1"].error and uninitialized["1"].error.code == -32600, "requests before initialize must fail")
+
+local badInitialize = runServer({
+	'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}',
+}, "bad initialize")
+assert(badInitialize["1"].error and badInitialize["1"].error.code == -32602, "incomplete initialize must fail")
+
+local newVersionInitialize = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"pob-mcp-test","version":"1"}}}'
+local newVersionResponses, newVersionList = runServer({
+	newVersionInitialize,
+	initialized,
+	'[{"jsonrpc":"2.0","id":2,"method":"ping"}]',
+}, "new version batch")
+local lastNewVersionResponse = newVersionList[#newVersionList]
+assert(lastNewVersionResponse.error and lastNewVersionResponse.error.code == -32600, "batch must be rejected for 2025-06-18")
+io.stdout:write("PASS stdio protocol edge cases\n")
 
 local importRequests = {
 	initialize,
@@ -179,6 +229,9 @@ local difference = math.abs((importedStats.requested.TotalDPS or 0) - (stats.req
 assert(difference < 0.0001, "DPS changed after build code round-trip")
 io.stdout:write("PASS stdio build code round-trip\n")
 
+if not os.getenv("POB_MCP_USER_PATH") then
+	os.remove(userPath)
+end
 if stderr:match("unexpected") then
 	io.stderr:write(stderr)
 end

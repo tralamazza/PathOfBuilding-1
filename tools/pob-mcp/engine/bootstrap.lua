@@ -199,6 +199,7 @@ function M.boot(options)
 		error(message, 0)
 	end
 	__mainObject__.main:ChangeUserPath(userPath .. "/", true)
+	__mainObject__.main.disableDevAutoSave = true
 	runCallback("OnFrame")
 	if __mainObject__.promptMsg then
 		local message = __mainObject__.promptMsg

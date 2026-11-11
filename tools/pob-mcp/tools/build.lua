@@ -37,7 +37,7 @@ local defs = {
 			format = S.enum({ "xml", "code" }, "Export format, defaults to xml"),
 			path = S.string("Optional file path to write"),
 		}),
-		annotations = { readOnlyHint = true },
+		annotations = { readOnlyHint = false, destructiveHint = true },
 	},
 	{
 		name = "build_state",
