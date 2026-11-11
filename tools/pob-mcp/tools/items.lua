@@ -32,6 +32,7 @@ local defs = {
 			raw = S.string("Full PoB item text"),
 			slot = S.string("Slot name, such as Helmet, Ring 1, Weapon 1, or Jewel 12345"),
 			equip = S.boolean("Auto-equip when slot is omitted; defaults to true"),
+			allow_requirement_violation = S.boolean("Allow items above the character level requirement"),
 		}, { "raw" }),
 		annotations = { destructiveHint = true },
 	},
@@ -46,6 +47,7 @@ local defs = {
 			sockets = S.string("Socket string, such as B-B-B-B-B-B or G-G-R"),
 			slot = S.string("Slot name"),
 			equip = S.boolean("Auto-equip when slot is omitted; defaults to true"),
+			allow_requirement_violation = S.boolean("Allow items above the character level requirement"),
 		}, { "name" }),
 		annotations = { destructiveHint = true },
 	},
@@ -61,8 +63,22 @@ local defs = {
 			sockets = S.string("Socket string"),
 			slot = S.string("Slot name"),
 			equip = S.boolean("Auto-equip when slot is omitted; defaults to true"),
+			allow_requirement_violation = S.boolean("Allow items above the character level requirement"),
 		}, { "base" }),
 		annotations = { destructiveHint = true },
+	},
+	{
+		name = "items_compare",
+		description = "Compare a candidate item against the currently equipped item without mutating the build.",
+		inputSchema = S.object({
+			item_raw = S.string("Raw PoB item text to compare"),
+			unique_name = S.string("Unique item name to compare"),
+			item_id = S.integer("Existing item id to compare"),
+			slot = S.string("Slot to compare against"),
+			stats = S.array(S.string("Output stat name"), "Stats to compare"),
+			use_full_dps = S.boolean("Use Full DPS for the comparison"),
+		}),
+		annotations = { readOnlyHint = true },
 	},
 	{
 		name = "items_get",
@@ -111,6 +127,10 @@ end
 
 function handlers.items_add_rare(args, ctx)
 	return ctx.api():itemsAddRare(args)
+end
+
+function handlers.items_compare(args, ctx)
+	return ctx.api():itemsCompare(args)
 end
 
 function handlers.items_get(args, ctx)

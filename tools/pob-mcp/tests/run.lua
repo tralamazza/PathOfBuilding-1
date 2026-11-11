@@ -411,6 +411,115 @@ test("passives_deallocate", function()
 	assertTrue(removed, "expected Deep Wisdom in removed list")
 end)
 
+test("build_validate", function()
+	api:snapshot({ name = "validate-backup" })
+	api:newBuild({ class = "Witch", level = 69 })
+	api:itemsAddRare({ base = "Glorious Plate", name = "Validation Plate", mods = { "+50 to maximum Life" } })
+	api:itemsAddUnique({ name = "Choir of the Storm" })
+	local validation = api:validateBuild()
+	assertTrue(type(validation.errors) == "table", "expected validation errors array")
+	assertTrue(type(validation.warnings) == "table", "expected validation warnings array")
+	assertTrue(not validation.valid, "expected the test build to report its attribute requirements")
+	local found
+	for _, validationError in ipairs(validation.errors) do
+		if validationError.code == "attribute_requirements" then
+			found = true
+		end
+		assertTrue(validationError.code ~= "socket_link", "granted skills should not require socket links")
+	end
+	assertTrue(found, "expected an attribute requirement validation error")
+	api:restore({ name = "validate-backup" })
+end)
+
+test("passives_plan_and_what_if", function()
+	api:snapshot({ name = "plan-backup" })
+	api:newBuild({ class = "Witch", level = 95 })
+	local search = api:passivesSearch({ type = "notable", allocated = false, reachable = true, limit = 10 })
+	assertTrue(search.total > 0, "expected a reachable notable")
+	local node = search.nodes[1]
+	local plan = api:passivesPlan({ ids = { node.id } })
+	assertTrue(plan.cost > 0, "expected a non-zero point cost")
+	assertTrue(plan.within_budget, "expected the plan to fit the budget")
+	local before = api:passivesGet().points.used
+	local whatIf = api:calcWhatIf({ add_node_ids = { node.id }, stats = { "Life" } })
+	assertTrue(whatIf.result ~= nil, "expected what-if output")
+	assertTrue(whatIf.changes.add_node_ids ~= nil, "expected what-if changes")
+	assertEqual(api:passivesGet().points.used, before)
+	local masteries = api:passivesSearch({ type = "mastery", allocated = false, reachable = true, limit = 1 })
+	if masteries.total > 0 then
+		local ok = pcall(function()
+			api:calcWhatIf({ add_node_ids = { masteries.nodes[1].id } })
+		end)
+		assertTrue(not ok, "mastery what-if should be rejected")
+	end
+	api:restore({ name = "plan-backup" })
+end)
+
+test("items_compare", function()
+	api:snapshot({ name = "compare-backup" })
+	api:newBuild({ class = "Witch", level = 95 })
+	api:itemsAddRare({ base = "Ruby Ring", name = "Equipped Ring", mods = { "+50 to maximum Life", "+40% to Fire Resistance" } })
+	local raw = "Rarity: RARE\nCompare Ring\nRuby Ring\nItem Level: 80\nQuality: 20\nImplicits: 1\n+40% to Fire Resistance\n+100 to maximum Life\n+45% to Cold Resistance\n+45% to Lightning Resistance"
+	local comparison = api:itemsCompare({ item_raw = raw, slot = "Ring 1", stats = { "Life", "FireResist" } })
+	assertTrue(comparison.base_requested.Life ~= nil, "expected a base Life value")
+	assertTrue(comparison.result_requested.Life ~= nil, "expected a comparison Life value")
+	assertTrue(comparison.changes.item ~= nil, "expected the compared item summary")
+	local invalidSlot = pcall(function()
+		api:itemsCompare({ item_raw = raw, slot = "Not A Slot" })
+	end)
+	assertTrue(not invalidSlot, "invalid comparison slots should be rejected")
+	api:restore({ name = "compare-backup" })
+end)
+
+test("constraints_survive_restore", function()
+	api:newBuild({ class = "Scion", ascendancy = "Ascendant", level = 69 })
+	api:setConstraints({ level = 69, no_uniques = true, enforce_points = true })
+	api:snapshot({ name = "constraints-snapshot" })
+	api:newBuild({ class = "Witch", level = 90 })
+	api:restore({ name = "constraints-snapshot" })
+	local constraints = api:getConstraints()
+	assertEqual(constraints.level, 69)
+	assertEqual(constraints.no_uniques, true)
+	assertEqual(constraints.enforce_points, true)
+end)
+
+test("constraints_and_item_requirements", function()
+	api:newBuild({ class = "Scion", ascendancy = "Ascendant", level = 69 })
+	api:setConstraints({ level = 69, no_uniques = true, enforce_points = true })
+	local validation = api:validateBuild()
+	assertEqual(validation.unique_count, 0)
+	assertTrue(validation.valid, "fresh constrained build should be valid")
+	local search = api:passivesSearch({ type = "notable", allocated = false, reachable = true, limit = 20 })
+	local node
+	for _, candidate in ipairs(search.nodes) do
+		if not candidate.ascendancy then
+			node = candidate
+			break
+		end
+	end
+	assertTrue(node ~= nil, "expected a reachable main-tree notable")
+	local plan = api:passivesPlan({ ids = { node.id } })
+	assertTrue(plan.cost > 0, "expected a planned allocation")
+	assertTrue(plan.within_budget, "expected the plan to fit level 69")
+	local okUnique = pcall(function()
+		api:itemsAddUnique({ name = "Abyssus" })
+	end)
+	assertTrue(not okUnique, "unique items should be rejected")
+	local okLevel = pcall(function()
+		api:itemsAddRaw({ raw = "Rarity: RARE\nRare Amulet\nMarble Amulet\nItem Level: 80\nQuality: 20\nImplicits: 0\n+60 to maximum Life" })
+	end)
+	assertTrue(not okLevel, "items above character level should be rejected")
+	api:setConstraints({ max_points = 0, enforce_points = true })
+	local okBudget = pcall(function()
+		api:passivesAllocate({ ids = { node.id } })
+	end)
+	assertTrue(not okBudget, "allocations over the configured budget should be rejected")
+	local allowed = api:passivesAllocate({ ids = { node.id }, allow_over_budget = true })
+	assertTrue(allowed.points.used > 0, "expected the over-budget allocation to succeed: " .. mcpJson.encode(allowed))
+	local overBudget = api:validateBuild()
+	assertTrue(not overBudget.valid, "over-budget builds should be invalid: " .. mcpJson.encode(overBudget.errors))
+end)
+
 test("invalid_requests", function()
 	local okNode = pcall(function()
 		api:passivesAllocate({ names = { "Definitely Not A Node" } })

@@ -10,6 +10,43 @@ local function objectMap(value)
 	return value
 end
 
+local function questPointsForLevel(level)
+	if level >= 67 then
+		return 23
+	elseif level >= 64 then
+		return 20
+	elseif level >= 60 then
+		return 18
+	elseif level >= 54 then
+		return 15
+	elseif level >= 50 then
+		return 12
+	elseif level >= 44 then
+		return 9
+	elseif level >= 40 then
+		return 7
+	elseif level >= 32 then
+		return 6
+	elseif level >= 22 then
+		return 4
+	elseif level >= 12 then
+		return 2
+	end
+	return 0
+end
+
+local function maxLinkedSockets(item)
+	local counts = {}
+	local maximum = 0
+	for _, socket in ipairs(item and item.sockets or {}) do
+		counts[socket.group] = (counts[socket.group] or 0) + 1
+		if counts[socket.group] > maximum then
+			maximum = counts[socket.group]
+		end
+	end
+	return maximum
+end
+
 local Api = {}
 Api.__index = Api
 
@@ -77,12 +114,88 @@ function M.new(env)
 	local self = setmetatable({}, Api)
 	self.env = env
 	self.snapshots = {}
+	self.snapshotConstraints = {}
 	self.snapshotCounter = 0
+	self.constraints = {
+		level = nil,
+		max_points = nil,
+		no_uniques = false,
+		enforce_points = false,
+	}
 	return self
 end
 
 function Api:getBuild()
 	return self.env.main.modes["BUILD"]
+end
+
+function Api:setConstraints(options)
+	options = options or {}
+	local constraints = self.constraints
+	local build = self:getBuild()
+	if options.level ~= nil then
+		local level = tonumber(options.level)
+		if not level then
+			error("Constraint level must be a number", 0)
+		end
+		constraints.level = util.clamp(math.floor(level), 1, 100)
+		build.characterLevel = constraints.level
+		build.characterLevelAutoMode = false
+		build.configTab:BuildModList()
+		build.buildFlag = true
+		if options.enforce_points == nil then
+			constraints.enforce_points = true
+		end
+	end
+	if options.max_points ~= nil then
+		local maxPoints = tonumber(options.max_points)
+		if not maxPoints then
+			error("max_points must be a number", 0)
+		end
+		constraints.max_points = math.max(0, math.floor(maxPoints))
+	end
+	if options.no_uniques ~= nil then
+		constraints.no_uniques = options.no_uniques == true
+	end
+	if options.enforce_points ~= nil then
+		constraints.enforce_points = options.enforce_points == true
+	end
+	if options.level ~= nil or options.max_points ~= nil then
+		self:frame()
+	end
+	return self:getConstraints()
+end
+
+function Api:getConstraints()
+	return {
+		level = self.constraints.level,
+		max_points = self.constraints.max_points,
+		no_uniques = self.constraints.no_uniques,
+		enforce_points = self.constraints.enforce_points,
+	}
+end
+
+function Api:pointBudget(build)
+	build = build or self:getBuild()
+	local level = self.constraints.level or build.characterLevel or 1
+	local extra = build.calcsTab.mainOutput and build.calcsTab.mainOutput.ExtraPoints or 0
+	local maximum = (level - 1) + questPointsForLevel(level) + extra
+	if self.constraints.max_points then
+		maximum = math.min(maximum, self.constraints.max_points)
+	end
+	local used, ascendancyUsed, secondaryUsed = build.spec:CountAllocNodes()
+	return {
+		level = level,
+		quest_points = questPointsForLevel(level),
+		extra_points = extra,
+		max = maximum,
+		used = used,
+		unspent = maximum - used,
+		ascendancy_used = ascendancyUsed,
+		ascendancy_max = 8,
+		secondary_ascendancy_used = secondaryUsed,
+		secondary_ascendancy_max = 8,
+	}
 end
 
 function Api:checkPrompt()
@@ -322,17 +435,200 @@ function Api:warnings(build)
 end
 
 function Api:points(build)
-	local used, ascendancyUsed, secondaryUsed = build.spec:CountAllocNodes()
-	local extraPoints = build.calcsTab.mainOutput and build.calcsTab.mainOutput.ExtraPoints or 0
-	local maximum = 99 + 23 + extraPoints
+	return self:pointBudget(build)
+end
+
+function Api:validateBuild()
+	local build = self:getBuild()
+	local errors = {}
+	local warnings = {}
+	local seenErrors = {}
+	local seenWarnings = {}
+	local function addError(code, message)
+		local key = code .. ":" .. message
+		if not seenErrors[key] then
+			seenErrors[key] = true
+			errors[#errors + 1] = { code = code, message = message }
+		end
+	end
+	local function addWarning(code, message)
+		local key = code .. ":" .. message
+		if not seenWarnings[key] then
+			seenWarnings[key] = true
+			warnings[#warnings + 1] = { code = code, message = message }
+		end
+	end
+	local points = self:pointBudget()
+	if points.used > points.max then
+		addError("point_budget", string.format("Build uses %d passive points but level %d allows at most %d", points.used, points.level, points.max))
+	end
+	if points.ascendancy_used > points.ascendancy_max then
+		addError("ascendancy_budget", string.format("Build uses %d ascendancy points but only %d are allowed", points.ascendancy_used, points.ascendancy_max))
+	end
+	if points.secondary_ascendancy_used > points.secondary_ascendancy_max then
+		addError("secondary_ascendancy_budget", string.format("Build uses %d secondary ascendancy points but only %d are allowed", points.secondary_ascendancy_used, points.secondary_ascendancy_max))
+	end
+	local uniqueCount = 0
+	local itemsTab = build.itemsTab
+	for _, item in pairs(itemsTab and itemsTab.items or {}) do
+		if item.rarity == "UNIQUE" or item.rarity == "RELIC" then
+			uniqueCount = uniqueCount + 1
+		end
+	end
+	if self.constraints.no_uniques and uniqueCount > 0 then
+		addError("no_uniques", string.format("Build contains %d unique item(s) but no_uniques is enabled", uniqueCount))
+	end
+	local output = build.calcsTab.mainOutput or {}
+	for _, slot in ipairs(itemsTab and itemsTab.orderedSlots or {}) do
+		local item = itemsTab.items[slot.selItemId]
+		if item and slot:IsShown() then
+			local requirements = item.requirements or {}
+			if requirements.level and requirements.level > build.characterLevel then
+				addError("item_level", string.format("%s requires level %d but the character is level %d", slot.slotName, requirements.level, build.characterLevel))
+			end
+		end
+	end
+	if (output.ReqStr or 0) > (output.Str or 0) then
+		addError("attribute_requirements", string.format("Build requires %d Strength but has %d", output.ReqStr or 0, output.Str or 0))
+	end
+	if (output.ReqDex or 0) > (output.Dex or 0) then
+		addError("attribute_requirements", string.format("Build requires %d Dexterity but has %d", output.ReqDex or 0, output.Dex or 0))
+	end
+	if (output.ReqInt or 0) > (output.Int or 0) then
+		addError("attribute_requirements", string.format("Build requires %d Intelligence but has %d", output.ReqInt or 0, output.Int or 0))
+	end
+	for index, group in ipairs(build.skillsTab and build.skillsTab.socketGroupList or {}) do
+		if group.enabled ~= false and not group.source then
+			local label = group.displayLabel or group.label or ("Skill group " .. index)
+			if not group.slot then
+				addWarning("skill_slot", label .. " is not socketed in an item")
+			else
+				local slot = itemsTab and itemsTab.slots[group.slot]
+				local item = slot and itemsTab.items[slot.selItemId]
+				if not item then
+					addError("skill_slot", label .. " is socketed in an empty " .. group.slot .. " slot")
+				else
+					local linked = maxLinkedSockets(item)
+					if linked < #(group.gemList or {}) then
+						addError("socket_link", label .. " needs " .. #(group.gemList or {}) .. " linked sockets but " .. group.slot .. " has " .. linked)
+					end
+				end
+			end
+			for _, gem in ipairs(group.gemList or {}) do
+				if gem.enabled ~= false and gem.reqLevel and gem.reqLevel > build.characterLevel then
+					addError("gem_level", string.format("%s requires level %d but the character is level %d", gem.nameSpec or "Gem", gem.reqLevel, build.characterLevel))
+				end
+				if gem.errMsg then
+					addWarning("gem", gem.errMsg)
+				end
+			end
+		end
+	end
+	local mainSkill = self:mainSkillInfo(build)
+	local isRighteousFire = mainSkill.name == "Righteous Fire" or mainSkill.name == "Righteous Fire of Arcane Devotion"
+	if isRighteousFire then
+		local netRegen = output.NetLifeRegen
+		if type(netRegen) ~= "number" then
+			addWarning("rf_sustain", "Could not determine Righteous Fire net life regen")
+		elseif netRegen <= 0 then
+			addError("rf_sustain", string.format("Righteous Fire is not sustainable: net life regen is %.2f per second", netRegen))
+		end
+	end
+	if (output.MissingFireResist or 0) > 0 then
+		addWarning("resistance", string.format("Missing %d%% Fire Resistance", output.MissingFireResist))
+	end
+	if (output.MissingColdResist or 0) > 0 then
+		addWarning("resistance", string.format("Missing %d%% Cold Resistance", output.MissingColdResist))
+	end
+	if (output.MissingLightningResist or 0) > 0 then
+		addWarning("resistance", string.format("Missing %d%% Lightning Resistance", output.MissingLightningResist))
+	end
+	if (output.ChaosResist or 0) < 0 then
+		addWarning("resistance", string.format("Chaos resistance is %d%%", output.ChaosResist or 0))
+	end
+	if output.ManaHasCost then
+		local payable = output.ManaCostPayablePool or output.ManaUnreserved or 0
+		if (output.ManaCost or 0) > payable then
+			addError("mana_cost", string.format("Main skill costs %d mana but only %d is payable", output.ManaCost or 0, payable))
+		end
+	end
+	for _, warning in ipairs(self:warnings(build)) do
+		addWarning("pob", warning)
+	end
 	return {
-		used = used,
-		max = maximum,
-		unspent = maximum - used,
-		ascendancy_used = ascendancyUsed,
-		ascendancy_max = 8,
-		secondary_ascendancy_used = secondaryUsed,
-		secondary_ascendancy_max = 8,
+		valid = #errors == 0,
+		errors = errors,
+		warnings = warnings,
+		points = points,
+		unique_count = uniqueCount,
+		constraints = self:getConstraints(),
+	}
+end
+
+function Api:planAllocation(nodes)
+	local build = self:getBuild()
+	local added = {}
+	local seen = {}
+	local unreachable = {}
+	local mainCost = 0
+	local ascendancyCost = 0
+	local secondaryCost = 0
+	for _, node in ipairs(nodes) do
+		if not node.alloc then
+			if not node.path then
+				unreachable[#unreachable + 1] = {
+					id = node.id,
+					name = node.dn or node.name,
+				}
+			else
+				for _, pathNode in ipairs(node.path) do
+					if not pathNode.alloc and not seen[pathNode.id] then
+						seen[pathNode.id] = true
+						added[#added + 1] = {
+							id = pathNode.id,
+							name = pathNode.dn or pathNode.name,
+							type = pathNode.type,
+						}
+						if pathNode.ascendancyName then
+							if not pathNode.isMultipleChoiceOption then
+								if build.spec.tree.secondaryAscendNameMap and build.spec.tree.secondaryAscendNameMap[pathNode.ascendancyName] then
+									secondaryCost = secondaryCost + 1
+								else
+									ascendancyCost = ascendancyCost + 1
+								end
+							end
+						else
+							mainCost = mainCost + 1
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(added, function(a, b)
+		return a.id < b.id
+	end)
+	local points = self:pointBudget()
+	return {
+		added = added,
+		cost = #added,
+		main_cost = mainCost,
+		ascendancy_cost = ascendancyCost,
+		secondary_ascendancy_cost = secondaryCost,
+		unreachable = unreachable,
+		points = {
+			used = points.used,
+			after = points.used + mainCost,
+			max = points.max,
+			remaining = points.unspent - mainCost,
+			ascendancy_used = points.ascendancy_used,
+			ascendancy_max = points.ascendancy_max,
+			secondary_ascendancy_used = points.secondary_ascendancy_used,
+			secondary_ascendancy_max = points.secondary_ascendancy_max,
+		},
+		within_budget = points.used + mainCost <= points.max
+			and points.ascendancy_used + ascendancyCost <= points.ascendancy_max
+			and points.secondary_ascendancy_used + secondaryCost <= points.secondary_ascendancy_max,
 	}
 end
 
@@ -393,7 +689,17 @@ function Api:newBuild(options)
 	self.env.runCallback("OnFrame")
 	self:checkPrompt()
 	local build = self:getBuild()
+	self.constraints = {
+		level = nil,
+		max_points = nil,
+		no_uniques = false,
+		enforce_points = false,
+	}
 	self:applyCharacter(build, options)
+	if options.level ~= nil then
+		self.constraints.level = build.characterLevel
+		self.constraints.enforce_points = true
+	end
 	self:frame()
 	return self:summary()
 end
@@ -402,6 +708,12 @@ function Api:loadXML(xml, name, convert)
 	if type(xml) ~= "string" or #xml == 0 then
 		error("Build XML is empty", 0)
 	end
+	self.constraints = {
+		level = nil,
+		max_points = nil,
+		no_uniques = false,
+		enforce_points = false,
+	}
 	self.env.main:SetMode("BUILD", false, name or "Imported Build", xml, convert ~= false)
 	self:frame()
 	return self:summary()
@@ -506,6 +818,7 @@ function Api:snapshot(options)
 		error("PoB failed to serialize the build", 0)
 	end
 	self.snapshots[name] = xml
+	self.snapshotConstraints[name] = self:getConstraints()
 	return {
 		name = name,
 		bytes = #xml,
@@ -518,13 +831,23 @@ function Api:restore(options)
 	if not name or not self.snapshots[name] then
 		error("Unknown snapshot '" .. tostring(name) .. "'", 0)
 	end
-	return self:importBuild({ xml = self.snapshots[name], name = "Snapshot " .. name, convert = false })
+	local savedConstraints = self.snapshotConstraints[name] or self:getConstraints()
+	local ok, result = pcall(self.importBuild, self, { xml = self.snapshots[name], name = "Snapshot " .. name, convert = false })
+	self.constraints = savedConstraints
+	if not ok then
+		error(result, 0)
+	end
+	return result
 end
 
 function Api:characterSet(options)
 	options = options or {}
 	local build = self:getBuild()
 	self:applyCharacter(build, options)
+	if options.level ~= nil then
+		self.constraints.level = build.characterLevel
+		self.constraints.enforce_points = true
+	end
 	self:frame()
 	return self:summary()
 end
@@ -772,12 +1095,36 @@ function Api:applyMasteryEffect(node, effectId)
 	end
 end
 
+function Api:passivesPlan(options)
+	options = options or {}
+	local nodes, errors = self:resolveNodes(options)
+	if #nodes == 0 then
+		error(#errors > 0 and table.concat(errors, "; ") or "No nodes supplied", 0)
+	end
+	local plan = self:planAllocation(nodes)
+	plan.errors = errors
+	plan.mastery_required = {}
+	for _, node in ipairs(nodes) do
+		if not node.alloc and node.type == "Mastery" then
+			plan.mastery_required[#plan.mastery_required + 1] = {
+				id = node.id,
+				name = node.dn or node.name,
+			}
+		end
+	end
+	return plan
+end
+
 function Api:passivesAllocate(options)
 	options = options or {}
 	local build = self:getBuild()
 	local nodes, errors = self:resolveNodes(options)
 	if #nodes == 0 then
 		error(#errors > 0 and table.concat(errors, "; ") or "No nodes supplied", 0)
+	end
+	local plan = self:planAllocation(nodes)
+	if self.constraints.enforce_points and not plan.within_budget and options.allow_over_budget ~= true then
+		error(string.format("Point budget exceeded: allocation adds %d main points and %d ascendancy points, putting the build at %d/%d main and %d/8 ascendancy", plan.main_cost, plan.ascendancy_cost + plan.secondary_ascendancy_cost, plan.points.after, plan.points.max, plan.points.ascendancy_used + plan.ascendancy_cost + plan.secondary_ascendancy_cost), 0)
 	end
 	local masteryEffects = {}
 	for key, value in pairs(options.mastery_effects or {}) do
@@ -828,6 +1175,7 @@ function Api:passivesAllocate(options)
 		added = added,
 		errors = errors,
 		points = self:points(build),
+		plan = plan,
 		state = self:passivesGet(),
 	}
 end
@@ -1319,6 +1667,19 @@ function Api:equipItem(item, slot)
 	return slot
 end
 
+function Api:checkItemConstraints(item, options)
+	options = options or {}
+	if (item.rarity == "UNIQUE" or item.rarity == "RELIC") and self.constraints.no_uniques then
+		error("Unique items are disabled by the current no_uniques constraint", 0)
+	end
+	if self.constraints.level and not options.allow_requirement_violation then
+		local level = item.requirements and item.requirements.level
+		if level and level > self:getBuild().characterLevel then
+			error(string.format("Item requires level %d but the character is level %d", level, self:getBuild().characterLevel), 0)
+		end
+	end
+end
+
 function Api:itemsAddRaw(options)
 	options = options or {}
 	local build = self:getBuild()
@@ -1332,6 +1693,7 @@ function Api:itemsAddRaw(options)
 	if not item or not item.base then
 		error("Could not parse item text; check the base item name", 0)
 	end
+	self:checkItemConstraints(item, options)
 	if options.slot and options.slot ~= "" then
 		self:validateItemSlot(item, options.slot)
 	end
@@ -1422,6 +1784,7 @@ function Api:itemsAddUnique(options)
 		raw = raw,
 		slot = options.slot,
 		equip = options.equip,
+		allow_requirement_violation = options.allow_requirement_violation,
 	})
 end
 
@@ -1485,6 +1848,7 @@ function Api:itemsAddRare(options)
 		raw = table.concat(lines, "\n"),
 		slot = options.slot,
 		equip = options.equip,
+		allow_requirement_violation = options.allow_requirement_violation,
 	})
 end
 
@@ -1742,6 +2106,195 @@ function Api:configSet(options)
 		config = self:configGet(),
 		summary = self:summary(),
 	}
+end
+
+function Api:whatIfItem(options)
+	if options.item_id then
+		local itemId = tonumber(options.item_id)
+		local item = itemId and self:getBuild().itemsTab.items[itemId]
+		if not item then
+			error("Unknown item id '" .. tostring(options.item_id) .. "'", 0)
+		end
+		return item
+	end
+	local raw = options.item_raw
+	if not raw and options.unique_name then
+		local unique = self:findUnique(options.unique_name)
+		if not unique then
+			error("Unknown unique '" .. tostring(options.unique_name) .. "'", 0)
+		end
+		raw = unique:BuildRaw()
+	end
+	if not raw then
+		return nil
+	end
+	local item = new("Item"):Item(raw)
+	if not item.base then
+		error("Could not parse the comparison item", 0)
+	end
+	item:BuildModList()
+	return item
+end
+
+function Api:calcWhatIf(options)
+	options = options or {}
+	local build = self:getBuild()
+	local calcFunc, calcBase = build.calcsTab:GetMiscCalculator()
+	if not calcFunc or not calcBase then
+		error("Calculations are not ready", 0)
+	end
+	local override = {}
+	local changes = {}
+	if options.add_node_ids then
+		local nodes = {}
+		for _, idValue in ipairs(options.add_node_ids) do
+			local node = build.spec.nodes[tonumber(idValue)]
+			if not node then
+				error("Unknown node id '" .. tostring(idValue) .. "'", 0)
+			end
+			if not node.alloc then
+				if node.type == "Mastery" then
+					error("Mastery what-if comparisons are not supported; allocate the mastery with passives_allocate instead", 0)
+				end
+				if not node.path then
+					error("Node '" .. tostring(node.dn or node.name) .. "' is unreachable", 0)
+				end
+				for _, pathNode in ipairs(node.path) do
+					nodes[pathNode] = true
+				end
+			end
+		end
+		override.addNodes = nodes
+		changes.add_node_ids = options.add_node_ids
+	end
+	if options.remove_node_ids then
+		local nodes = {}
+		for _, idValue in ipairs(options.remove_node_ids) do
+			local node = build.spec.nodes[tonumber(idValue)]
+			if not node then
+				error("Unknown node id '" .. tostring(idValue) .. "'", 0)
+			end
+			if node.alloc then
+				for _, depNode in ipairs(node.depends or {}) do
+					nodes[depNode] = true
+				end
+			end
+		end
+		override.removeNodes = nodes
+		changes.remove_node_ids = options.remove_node_ids
+	end
+	local item = self:whatIfItem(options)
+	if item then
+		local slot = options.slot
+		if not slot then
+			local itemsTab = build.itemsTab
+			for _, candidate in ipairs(itemsTab.orderedSlots) do
+				if candidate.selItemId == item.id then
+					slot = candidate.slotName
+					break
+				end
+			end
+		end
+		if not slot then
+			if item.type == "Jewel" then
+				error("Jewel comparisons require an explicit slot", 0)
+			end
+			slot = item:GetPrimarySlot()
+		end
+		self:validateItemSlot(item, slot)
+		override.repSlotName = slot
+		override.repItem = item
+		changes.item = self:itemSummary(item)
+		changes.slot = slot
+	end
+	if options.toggle_flask_id then
+		local itemId = tonumber(options.toggle_flask_id)
+		local flask = itemId and build.itemsTab.items[itemId]
+		if not flask then
+			error("Unknown flask item id '" .. tostring(options.toggle_flask_id) .. "'", 0)
+		end
+		override.toggleFlask = flask
+		changes.toggle_flask_id = itemId
+	end
+	if options.conditions then
+		override.conditions = options.conditions
+		changes.conditions = options.conditions
+	end
+	if not next(override) then
+		error("calc_what_if requires at least one change", 0)
+	end
+	local output = calcFunc(override, options.use_full_dps)
+	local result = {
+		base = objectMap(self:curatedStats(calcBase)),
+		result = objectMap(self:curatedStats(output)),
+		delta = objectMap({}),
+		changes = changes,
+	}
+	local requested = options.stats or curatedStatKeys
+	result.base_requested = objectMap({})
+	result.result_requested = objectMap({})
+	for _, key in ipairs(requested) do
+		local baseValue = calcBase[key]
+		local resultValue = output[key]
+		if type(baseValue) == "number" or type(resultValue) == "number" then
+			result.base_requested[key] = util.sanitize(baseValue)
+			result.result_requested[key] = util.sanitize(resultValue)
+		end
+	end
+	local deltaKeys = {}
+	for key in pairs(result.result) do
+		deltaKeys[key] = true
+	end
+	for _, key in ipairs(requested) do
+		deltaKeys[key] = true
+	end
+	for key in pairs(deltaKeys) do
+		local baseValue = calcBase[key]
+		local resultValue = output[key]
+		if type(baseValue) == "number" and type(resultValue) == "number" then
+			local delta = resultValue - baseValue
+			result.delta[key] = {
+				value = util.sanitize(delta),
+				percent = baseValue ~= 0 and util.sanitize(delta / math.abs(baseValue) * 100) or nil,
+			}
+		end
+	end
+	return result
+end
+
+function Api:itemsCompare(options)
+	options = options or {}
+	local result = self:calcWhatIf({
+		item_raw = options.item_raw,
+		unique_name = options.unique_name,
+		item_id = options.item_id,
+		slot = options.slot,
+		stats = options.stats,
+		use_full_dps = options.use_full_dps,
+	})
+	if result.changes and result.changes.item then
+		local item = self:whatIfItem(options)
+		local requirements = item.requirements or {}
+		local level = requirements.level
+		local buildOutput = self:getBuild().calcsTab.mainOutput or {}
+		local problems = {}
+		if level and level > self:getBuild().characterLevel then
+			problems[#problems + 1] = string.format("requires level %d but the character is level %d", level, self:getBuild().characterLevel)
+		end
+		if requirements.strMod and requirements.strMod > (buildOutput.Str or 0) then
+			problems[#problems + 1] = string.format("requires %d Strength but the build has %d", requirements.strMod, buildOutput.Str or 0)
+		end
+		if requirements.dexMod and requirements.dexMod > (buildOutput.Dex or 0) then
+			problems[#problems + 1] = string.format("requires %d Dexterity but the build has %d", requirements.dexMod, buildOutput.Dex or 0)
+		end
+		if requirements.intMod and requirements.intMod > (buildOutput.Int or 0) then
+			problems[#problems + 1] = string.format("requires %d Intelligence but the build has %d", requirements.intMod, buildOutput.Int or 0)
+		end
+		if #problems > 0 then
+			result.requirement_warning = "Item " .. table.concat(problems, "; ")
+		end
+	end
+	return result
 end
 
 function Api:calcStats(options)

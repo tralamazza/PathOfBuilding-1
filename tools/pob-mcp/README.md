@@ -59,12 +59,15 @@ The engine boots lazily on the first tool call. Startup is roughly 1.5 seconds a
 | `build_snapshot` | Save the current build XML under a name. |
 | `build_restore` | Restore a saved snapshot. |
 | `character_set` | Change level, class, or ascendancy. |
+| `build_set_constraints` | Set level, point budget, unique-item policy, and point enforcement. |
+| `build_validate` | Validate point budget, item requirements, sockets, resistances, and sustain. |
 
 ### Passives
 
 | Tool | Purpose |
 |---|---|
 | `passives_search` | Search by name, stat text, type, ascendancy, reachability, allocation. |
+| `passives_plan` | Preview path cost and point-budget usage before allocating. |
 | `passives_get` | Allocated nodes, mastery selections, and point usage. |
 | `passives_allocate` | Allocate nodes by id or name; path nodes are added automatically. |
 | `passives_deallocate` | Deallocate nodes and dependants. |
@@ -87,6 +90,7 @@ Node ids are specific to the current tree version. Search results include `path_
 | Tool | Purpose |
 |---|---|
 | `items_search_uniques` | Search the unique database by name, base, slot, or modifier text. |
+| `items_compare` | Compare a candidate item against the equipped item without mutating the build. |
 | `items_search_bases` | Search base item types for rare item creation. |
 | `items_add_raw` | Add an item from full PoB item text. |
 | `items_add_unique` | Add a unique by name, with optional variant and sockets. |
@@ -103,19 +107,20 @@ Node ids are specific to the current tree version. Search results include `path_
 | `config_get` | Values that differ from their defaults, including custom modifiers. |
 | `config_set` | Set config values and/or custom modifier text. |
 | `calc_stats` | Calculated stats; `all=true` returns the raw output table. |
+| `calc_what_if` | Evaluate node, item, flask, or condition changes without mutating the build. |
 | `calc_breakdown` | Detailed calculation breakdown for a stat. |
 | `calc_warnings` | Build warnings and main-skill messages. |
 
 ## Agent workflow
 
 1. `meta_info` to discover classes and ascendancies.
-2. `build_new` with class, ascendancy, and level.
+2. `build_new` with class, ascendancy, and level; then `build_set_constraints` for level/budget/no-unique rules.
 3. `skills_search` and `skills_add_group` for the main skill and supports.
 4. `passives_search` and `passives_allocate` for the tree.
 5. `items_search_uniques`, `items_add_unique`, or `items_add_rare`.
 6. `config_search` and `config_set` for buffs, conditions, and custom modifiers.
 7. `calc_stats`, `calc_breakdown`, and `calc_warnings` to inspect the result.
-8. `build_export` for XML or a share code.
+8. `build_validate`, then `build_export` for XML or a share code.
 
 Use `build_snapshot` before trying alternatives and `build_restore` to return.
 
@@ -126,10 +131,13 @@ This is a local stdio tool intended for a trusted MCP client. It can read and wr
 ## Notes
 
 - One MCP server process owns one active build. Use snapshots for alternatives.
+- `build_set_constraints` enforces point budgets and can reject unique items. `build_validate` is the final check before exporting a build.
+- Passing an explicit level to `build_new` or `character_set` also enables point-budget enforcement for that level.
+- Once a level constraint is set, item additions reject items above that level unless `allow_requirement_violation=true` is supplied.
 - Explicitly setting a level disables PoB's automatic level mode, so allocating passives will not overwrite the level.
 - Build share codes use zlib plus URL-safe Base64, handled inside the server.
 - Relative paths in `build_import` and `build_export` are resolved from the repository root.
-- `calc_what_if` and ranked suggestions are planned next; the engine already exposes the underlying misc calculator.
+- Ranked passive/item suggestions are planned next; `calc_what_if` already exposes the underlying misc calculator for safe comparisons.
 - The transport is isolated in `mcp/stdio.lua`, so an HTTP transport can be added without changing the tools.
 
 ## Tests

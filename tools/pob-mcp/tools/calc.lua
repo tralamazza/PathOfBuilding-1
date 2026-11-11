@@ -12,6 +12,23 @@ local defs = {
 		annotations = { readOnlyHint = true },
 	},
 	{
+		name = "calc_what_if",
+		description = "Evaluate passive-node, item, flask, or condition changes without mutating the active build.",
+		inputSchema = S.object({
+			add_node_ids = S.array(S.integer("Node id"), "Node ids to add"),
+			remove_node_ids = S.array(S.integer("Node id"), "Node ids to remove"),
+			item_raw = S.string("Raw PoB item text to compare"),
+			unique_name = S.string("Unique item name to compare"),
+			item_id = S.integer("Existing item id to compare"),
+			slot = S.string("Slot to replace"),
+			toggle_flask_id = S.integer("Flask item id to toggle"),
+			conditions = S.array(S.string("Condition flag"), "Extra condition flags"),
+			stats = S.array(S.string("Output stat name"), "Stats to compare"),
+			use_full_dps = S.boolean("Use Full DPS for the comparison"),
+		}),
+		annotations = { readOnlyHint = true },
+	},
+	{
 		name = "calc_breakdown",
 		description = "Return the calculation breakdown for a stat, such as Life, Mana, TotalDPS, or Armour.",
 		inputSchema = S.object({
@@ -32,6 +49,10 @@ local handlers = {}
 
 function handlers.calc_stats(args, ctx)
 	return ctx.api():calcStats(args)
+end
+
+function handlers.calc_what_if(args, ctx)
+	return ctx.api():calcWhatIf(args)
 end
 
 function handlers.calc_breakdown(args, ctx)

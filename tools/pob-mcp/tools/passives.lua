@@ -22,12 +22,22 @@ local defs = {
 		annotations = { readOnlyHint = true },
 	},
 	{
+		name = "passives_plan",
+		description = "Preview the path and point cost for allocating passive nodes, including budget usage.",
+		inputSchema = S.object({
+			ids = S.array(S.integer("Node id"), "Node ids to plan"),
+			names = S.array(S.string("Node name"), "Node names to plan"),
+		}),
+		annotations = { readOnlyHint = true },
+	},
+	{
 		name = "passives_allocate",
 		description = "Allocate passive nodes by id or name. Path nodes are allocated automatically. Mastery nodes require a mastery_effects entry.",
 		inputSchema = S.object({
 			ids = S.array(S.integer("Node id"), "Node ids to allocate"),
 			names = S.array(S.string("Node name"), "Node names to allocate"),
 			mastery_effects = S.anyObject("Map of mastery node id to mastery effect id"),
+			allow_over_budget = S.boolean("Allow allocation above the configured point budget"),
 		}),
 		annotations = { destructiveHint = true },
 	},
@@ -59,6 +69,10 @@ end
 
 function handlers.passives_get(_, ctx)
 	return ctx.api():passivesGet()
+end
+
+function handlers.passives_plan(args, ctx)
+	return ctx.api():passivesPlan(args)
 end
 
 function handlers.passives_allocate(args, ctx)

@@ -13,7 +13,7 @@ local defaultVersion = "2025-06-18"
 local instructions = table.concat({
 	"Path of Building build calculator. The active build is mutated in place.",
 	"Typical workflow: build_new, passives_search/passives_allocate, skills_search/skills_add_group, items_search_uniques or items_add_rare/items_add_raw, config_search/config_set, then calc_stats.",
-	"Use build_export to get XML or a share code. Node ids are specific to the current tree version.",
+	"Use calc_what_if for safe comparisons. Use build_set_constraints and build_validate to enforce level, budget, and item rules. Use build_export to get XML or a share code. Node ids are specific to the current tree version.",
 	"Use build_snapshot and build_restore before trying alternatives.",
 }, " ")
 

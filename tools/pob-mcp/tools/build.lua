@@ -71,6 +71,23 @@ local defs = {
 		}),
 		annotations = { destructiveHint = true },
 	},
+	{
+		name = "build_set_constraints",
+		description = "Set build constraints such as level, point budget, and whether unique items are allowed.",
+		inputSchema = S.object({
+			level = S.integer("Character level", { minimum = 1, maximum = 100 }),
+			max_points = S.integer("Maximum passive points", { minimum = 0 }),
+			no_uniques = S.boolean("Reject unique items"),
+			enforce_points = S.boolean("Reject passive allocations over the point budget"),
+		}),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "build_validate",
+		description = "Validate point budget, item requirements, skill links, resistances, sustain, and configured constraints.",
+		inputSchema = S.object(),
+		annotations = { readOnlyHint = true },
+	},
 }
 
 local handlers = {}
@@ -105,6 +122,14 @@ end
 
 function handlers.character_set(args, ctx)
 	return ctx.api():characterSet(args)
+end
+
+function handlers.build_set_constraints(args, ctx)
+	return ctx.api():setConstraints(args)
+end
+
+function handlers.build_validate(_, ctx)
+	return ctx.api():validateBuild()
 end
 
 return { defs = defs, handlers = handlers }
