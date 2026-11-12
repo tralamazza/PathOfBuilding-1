@@ -35,16 +35,204 @@ local function questPointsForLevel(level)
 	return 0
 end
 
-local function maxLinkedSockets(item)
+local function socketInfo(item)
 	local counts = {}
+	local total = 0
+	local abyssal = 0
 	local maximum = 0
 	for _, socket in ipairs(item and item.sockets or {}) do
-		counts[socket.group] = (counts[socket.group] or 0) + 1
-		if counts[socket.group] > maximum then
-			maximum = counts[socket.group]
+		if socket.color == "A" then
+			abyssal = abyssal + 1
+		else
+			total = total + 1
+			counts[socket.group] = (counts[socket.group] or 0) + 1
+			if counts[socket.group] > maximum then
+				maximum = counts[socket.group]
+			end
 		end
 	end
-	return maximum
+	local socketLimit = item and item.base and item.base.socketLimit or nil
+	return {
+		total = total,
+		abyssal = abyssal,
+		max_linked = maximum,
+		socket_limit = socketLimit,
+		capacity = socketLimit and math.max(0, socketLimit - abyssal) or nil,
+	}
+end
+
+local function maxLinkedSockets(item)
+	return socketInfo(item).max_linked
+end
+
+local function socketString(item)
+	local groups = {}
+	local output = {}
+	for _, socket in ipairs(item and item.sockets or {}) do
+		if not groups[socket.group] then
+			groups[socket.group] = {}
+			output[#output + 1] = groups[socket.group]
+		end
+		table.insert(groups[socket.group], socket.color)
+	end
+	local parts = {}
+	for _, group in ipairs(output) do
+		parts[#parts + 1] = table.concat(group, "-")
+	end
+	return table.concat(parts, " ")
+end
+
+local function parseSocketString(text)
+	local sockets = {}
+	local groupId = 0
+	for segment in tostring(text):gmatch("%S+") do
+		local clean = segment:gsub("%-", "")
+		if clean == "" or not clean:match("^[RGBWA]+$") then
+			error("Invalid socket segment '" .. segment .. "'", 0)
+		end
+		groupId = groupId + 1
+		for color in clean:gmatch(".") do
+			sockets[#sockets + 1] = { color = color, group = groupId }
+		end
+	end
+	if #sockets == 0 then
+		error("Socket string is empty", 0)
+	end
+	return sockets
+end
+
+local ffi = require("ffi")
+local isWindows = package.config:sub(1, 1) == "\\"
+if isWindows then
+	pcall(ffi.cdef, [[
+int _mkdir(const char *path);
+]])
+else
+	pcall(ffi.cdef, [[
+int mkdir(const char *path, unsigned int mode);
+]])
+end
+
+local function ensureDir(path)
+	local current = path:match("^[/\\]") and "" or nil
+	for part in tostring(path):gmatch("[^/\\]+") do
+		if current == nil then
+			current = part
+		else
+			current = current .. "/" .. part
+		end
+		if isWindows then
+			pcall(ffi.C._mkdir, current)
+		else
+			pcall(ffi.C.mkdir, current, 493)
+		end
+	end
+end
+
+local function shellQuote(value)
+	return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function normaliseBuildName(name)
+	local text = util.trim(tostring(name or ""))
+	if text == "" or text:find("[/\\]") or text:find("%.%.") then
+		error("Invalid build name '" .. tostring(name) .. "'", 0)
+	end
+	return text:gsub("%.xml$", "")
+end
+
+local function writeFileAtomic(path, data)
+	local temp = path .. ".tmp"
+	local file, err = io.open(temp, "wb")
+	if not file then
+		error("Could not write '" .. path .. "': " .. tostring(err), 0)
+	end
+	local ok, writeError = file:write(data)
+	if not ok then
+		file:close()
+		os.remove(temp)
+		error("Could not write '" .. path .. "': " .. tostring(writeError), 0)
+	end
+	local closed, closeError = file:close()
+	if not closed then
+		os.remove(temp)
+		error("Could not close '" .. path .. "': " .. tostring(closeError), 0)
+	end
+	local renamed, renameError = os.rename(temp, path)
+	if not renamed then
+		os.remove(temp)
+		error("Could not finalize '" .. path .. "': " .. tostring(renameError), 0)
+	end
+end
+
+local function listXmlFiles(directory)
+	local files = {}
+	if isWindows then
+		local pipe = io.popen('dir /b /s /a-d "' .. tostring(directory) .. '" 2>nul')
+		if pipe then
+			for path in pipe:lines() do
+				if path:lower():match("%.xml$") then
+					files[#files + 1] = path:gsub("\\", "/")
+				end
+			end
+			pipe:close()
+		end
+	else
+		local pipe = io.popen("find " .. shellQuote(directory) .. " -type f -name '*.xml' -print 2>/dev/null")
+		if pipe then
+			for path in pipe:lines() do
+				files[#files + 1] = path
+			end
+			pipe:close()
+		end
+	end
+	return files
+end
+
+local function readBuildHeader(path)
+	local file = io.open(path, "rb")
+	if not file then
+		return nil
+	end
+	local text = file:read(2048)
+	file:close()
+	if not text then
+		return nil
+	end
+	local tag = text:match("<Build%s+[^>]->")
+	if not tag then
+		return {}
+	end
+	return {
+		level = tonumber(tag:match('level="([^"]+)"')),
+		className = tag:match('className="([^"]+)"'),
+		ascendClassName = tag:match('ascendClassName="([^"]+)"'),
+	}
+end
+
+local function normaliseStatText(value)
+	return util.lower(tostring(value or "")):gsub("[^%w]+", "")
+end
+
+local function fuzzyStatMatch(haystack, needle)
+	if needle == "" then
+		return true, 0
+	end
+	local direct = haystack:find(needle, 1, true)
+	if direct then
+		return true, 1000 - direct
+	end
+	local position = 1
+	local gaps = 0
+	for index = 1, #needle do
+		local found = haystack:find(needle:sub(index, index), position, true)
+		if not found then
+			return false, 0
+		end
+		gaps = gaps + (found - position)
+		position = found + 1
+	end
+	return true, 100 - gaps
 end
 
 local Api = {}
@@ -92,6 +280,22 @@ local curatedStatKeys = {
 	"EffectiveMovementSpeedMod",
 	"ManaCost",
 	"Cooldown",
+}
+
+local groupSlotOrder = {
+	"Weapon 1",
+	"Weapon 2",
+	"Weapon 1 Swap",
+	"Weapon 2 Swap",
+	"Helmet",
+	"Body Armour",
+	"Gloves",
+	"Boots",
+	"Amulet",
+	"Ring 1",
+	"Ring 2",
+	"Ring 3",
+	"Belt",
 }
 
 local groupSlots = {
@@ -497,6 +701,7 @@ function Api:validateBuild()
 	if (output.ReqInt or 0) > (output.Int or 0) then
 		addError("attribute_requirements", string.format("Build requires %d Intelligence but has %d", output.ReqInt or 0, output.Int or 0))
 	end
+	local slotGemCounts = {}
 	for index, group in ipairs(build.skillsTab and build.skillsTab.socketGroupList or {}) do
 		if group.enabled ~= false and not group.source then
 			local label = group.displayLabel or group.label or ("Skill group " .. index)
@@ -510,7 +715,20 @@ function Api:validateBuild()
 				else
 					local linked = maxLinkedSockets(item)
 					if linked < #(group.gemList or {}) then
-						addError("socket_link", label .. " needs " .. #(group.gemList or {}) .. " linked sockets but " .. group.slot .. " has " .. linked)
+						addWarning("socket_link", label .. " needs " .. #(group.gemList or {}) .. " linked sockets but " .. group.slot .. " has " .. linked)
+					end
+					local count = 0
+					for _, gem in ipairs(group.gemList or {}) do
+						if gem.enabled ~= false and (gem.gemData or gem.grantedEffect) then
+							count = count + 1
+						end
+					end
+					slotGemCounts[group.slot] = (slotGemCounts[group.slot] or 0) + count
+					local diagnostics = self:skillSlotDiagnostics(group)
+					for _, diagnosticsGroup in ipairs(diagnostics and diagnostics.groups or {}) do
+						for _, mismatch in ipairs(diagnosticsGroup.mismatches or {}) do
+							addWarning("socket_color", label .. " has a socket color mismatch: " .. mismatch)
+						end
 					end
 				end
 			end
@@ -521,6 +739,16 @@ function Api:validateBuild()
 				if gem.errMsg then
 					addWarning("gem", gem.errMsg)
 				end
+			end
+		end
+	end
+	for slotName, count in pairs(slotGemCounts) do
+		local slot = itemsTab and itemsTab.slots[slotName]
+		local item = slot and itemsTab.items[slot.selItemId]
+		if item then
+			local info = socketInfo(item)
+			if count > info.total then
+				addWarning("socket_capacity", string.format("%s has %d gems but only %d normal gem sockets", slotName, count, info.total))
 			end
 		end
 	end
@@ -819,25 +1047,379 @@ function Api:snapshot(options)
 	end
 	self.snapshots[name] = xml
 	self.snapshotConstraints[name] = self:getConstraints()
-	return {
+	local result = {
 		name = name,
 		bytes = #xml,
 	}
+	if options.persistent then
+		local path = self:snapshotPath(name)
+		writeFileAtomic(path, xml)
+		writeFileAtomic(self:snapshotMetaPath(name), self:serialiseSnapshotMeta(name, build))
+		result.persistent = true
+		result.path = path
+	end
+	return result
 end
 
 function Api:restore(options)
 	options = options or {}
 	local name = options.name
-	if not name or not self.snapshots[name] then
+	local xml
+	local savedConstraints
+	if name and options.persistent then
+		local file, err = io.open(self:snapshotPath(name), "rb")
+		if not file then
+			if self.snapshots[name] then
+				xml = self.snapshots[name]
+				savedConstraints = self.snapshotConstraints[name] or self:getConstraints()
+			else
+				error("Unknown persistent snapshot '" .. tostring(name) .. "': " .. tostring(err), 0)
+			end
+		else
+			xml = file:read("*a")
+			file:close()
+			local metaFile = io.open(self:snapshotMetaPath(name), "rb")
+			local meta = metaFile and self:parseSnapshotMeta(metaFile:read("*a")) or {}
+			if metaFile then
+				metaFile:close()
+			end
+			savedConstraints = {
+				level = meta.level,
+				max_points = meta.max_points,
+				no_uniques = meta.no_uniques == true,
+				enforce_points = meta.enforce_points == true,
+			}
+			self.snapshots[name] = xml
+			self.snapshotConstraints[name] = savedConstraints
+		end
+	elseif name and self.snapshots[name] then
+		xml = self.snapshots[name]
+		savedConstraints = self.snapshotConstraints[name] or self:getConstraints()
+	else
 		error("Unknown snapshot '" .. tostring(name) .. "'", 0)
 	end
-	local savedConstraints = self.snapshotConstraints[name] or self:getConstraints()
-	local ok, result = pcall(self.importBuild, self, { xml = self.snapshots[name], name = "Snapshot " .. name, convert = false })
+	local ok, result = pcall(self.importBuild, self, { xml = xml, name = "Snapshot " .. tostring(name), convert = false })
 	self.constraints = savedConstraints
 	if not ok then
 		error(result, 0)
 	end
 	return result
+end
+
+
+function Api:buildRoot()
+	local root = self.env.main.buildPath
+	if not root or root == "" then
+		error("No build path is configured", 0)
+	end
+	ensureDir(root)
+	return root
+end
+
+function Api:resolveBuildPath(options)
+	options = options or {}
+	local root = self:buildRoot()
+	if options.path then
+		local path = options.path
+		if not (path:match("^[/\\]") or path:match("^%a:[/\\]")) then
+			path = root .. path
+		end
+		if path:find("%.%.") or path:sub(1, #root) ~= root then
+			error("Build path must stay inside the build directory", 0)
+		end
+		return path
+	end
+	local name = normaliseBuildName(options.name)
+	local subPath = options.sub_path and tostring(options.sub_path) or ""
+	if subPath ~= "" then
+		if subPath:find("%.%.") or subPath:find("^[/\\]") then
+			error("Invalid sub_path", 0)
+		end
+		subPath = subPath:gsub("[/\\]+$", "") .. "/"
+		ensureDir(root .. subPath:gsub("/$", ""))
+	end
+	return root .. subPath .. name .. ".xml"
+end
+
+function Api:buildList(options)
+	options = options or {}
+	local root = self:buildRoot()
+	local query = util.lower(util.trim(tostring(options.query or "")))
+	local subPath = options.sub_path and tostring(options.sub_path) or ""
+	if subPath ~= "" and (subPath:find("%.%.") or subPath:find("^[/\\]")) then
+		error("Invalid sub_path", 0)
+	end
+	local directory = root .. (subPath ~= "" and (subPath:gsub("[/\\]+$", "") .. "/") or "")
+	local files = {}
+	for _, fullPath in ipairs(listXmlFiles(directory)) do
+		local relative = fullPath:sub(#root + 1)
+		local relativeDir = relative:match("^(.*)/[^/]+$") or ""
+		local fileName = relative:match("([^/]+)$") or relative
+		local name = fileName:gsub("%.xml$", "")
+		local header = readBuildHeader(fullPath) or {}
+		local haystack = util.lower(table.concat({ name, relativeDir, header.className or "", header.ascendClassName or "" }, " "))
+		if query == "" or haystack:find(query, 1, true) then
+			files[#files + 1] = {
+				name = name,
+				path = relative,
+				class = header.className,
+				ascendancy = header.ascendClassName,
+				level = header.level,
+				active = fullPath == self:activeBuildPath(),
+			}
+		end
+	end
+	table.sort(files, function(a, b)
+		return util.lower(a.name) < util.lower(b.name)
+	end)
+	return {
+		root = root,
+		total = #files,
+		builds = files,
+	}
+end
+
+function Api:activeBuildPath()
+	local build = self:getBuild()
+	return build and build.dbFileName or nil
+end
+
+function Api:buildLoad(options)
+	options = options or {}
+	local path = self:resolveBuildPath(options)
+	local file, err = io.open(path, "rb")
+	if not file then
+		error("Could not open build '" .. path .. "': " .. tostring(err), 0)
+	end
+	local xml = file:read("*a")
+	file:close()
+	local name = options.name and normaliseBuildName(options.name) or path:match("([^/]+)%.xml$") or "Build"
+	local summary = self:loadXML(xml, name, options.convert ~= false)
+	summary.path = path
+	return summary
+end
+
+function Api:buildRename(options)
+	options = options or {}
+	local source = self:resolveBuildPath(options)
+	if not options.new_name then
+		error("build_rename requires new_name", 0)
+	end
+	local destinationSubPath = options.sub_path
+	if destinationSubPath == nil and options.path ~= nil then
+		local root = self:buildRoot()
+		local relative = source:sub(#root + 1)
+		destinationSubPath = relative:match("^(.*)/[^/]+$")
+	end
+	local destination = self:resolveBuildPath({ name = options.new_name, sub_path = destinationSubPath })
+	if source == destination then
+		error("Source and destination are the same", 0)
+	end
+	if not options.overwrite then
+		local existing = io.open(destination, "rb")
+		if existing then
+			existing:close()
+			error("Destination build already exists: " .. destination, 0)
+		end
+	end
+	local renamed, err = os.rename(source, destination)
+	if not renamed then
+		error("Could not rename build: " .. tostring(err), 0)
+	end
+	local build = self:getBuild()
+	if build and build.dbFileName == source then
+		build.dbFileName = destination
+		build.name = normaliseBuildName(options.new_name)
+	end
+	return {
+		from = source,
+		to = destination,
+		name = normaliseBuildName(options.new_name),
+	}
+end
+
+function Api:buildFork(options)
+	options = options or {}
+	if not options.new_name then
+		error("build_fork requires new_name", 0)
+	end
+	local xml
+	local source
+	if options.path or options.name then
+		source = self:resolveBuildPath(options)
+		local file, err = io.open(source, "rb")
+		if not file then
+			error("Could not open build '" .. source .. "': " .. tostring(err), 0)
+		end
+		xml = file:read("*a")
+		file:close()
+	else
+		local build = self:getBuild()
+		xml = build:SaveDB("fork")
+		if not xml then
+			error("PoB failed to serialize the build", 0)
+		end
+	end
+	local destination = self:resolveBuildPath({ name = options.new_name, sub_path = options.sub_path })
+	if not options.overwrite then
+		local existing = io.open(destination, "rb")
+		if existing then
+			existing:close()
+			error("Destination build already exists: " .. destination, 0)
+		end
+	end
+	writeFileAtomic(destination, xml)
+	local result = {
+		from = source,
+		to = destination,
+		name = normaliseBuildName(options.new_name),
+	}
+	if options.switch ~= false then
+		result.build = self:loadXML(xml, result.name, true)
+		result.build.path = destination
+	end
+	return result
+end
+
+function Api:buildDelete(options)
+	options = options or {}
+	local path = self:resolveBuildPath(options)
+	if path == self:activeBuildPath() then
+		error("Cannot delete the active build; load another build first", 0)
+	end
+	local removed, err = os.remove(path)
+	if not removed then
+		error("Could not delete build: " .. tostring(err), 0)
+	end
+	return { path = path, deleted = true }
+end
+
+function Api:snapshotsDir()
+	local directory = self.env.main.userPath .. "MCP/Snapshots/"
+	ensureDir(self.env.main.userPath .. "MCP")
+	ensureDir(directory)
+	return directory
+end
+
+function Api:snapshotMetaPath(name)
+	return self:snapshotsDir() .. normaliseBuildName(name) .. ".meta"
+end
+
+function Api:snapshotPath(name)
+	return self:snapshotsDir() .. normaliseBuildName(name) .. ".xml"
+end
+
+function Api:serialiseSnapshotMeta(name, build)
+	local constraints = self:getConstraints()
+	local lines = {
+		"name=" .. tostring(name):gsub("[\r\n]", " "),
+		"level=" .. tostring(constraints.level or ""),
+		"max_points=" .. tostring(constraints.max_points or ""),
+		"no_uniques=" .. tostring(constraints.no_uniques and true or false),
+		"enforce_points=" .. tostring(constraints.enforce_points and true or false),
+		"tree=" .. tostring(build.treeVersion or build.spec.treeVersion or ""),
+	}
+	return table.concat(lines, "\n") .. "\n"
+end
+
+function Api:parseSnapshotMeta(text)
+	local meta = {}
+	for line in tostring(text or ""):gmatch("[^\n]+") do
+		local key, value = line:match("^([^=]+)=(.*)$")
+		if key then
+			meta[key] = value
+		end
+	end
+	meta.level = meta.level and tonumber(meta.level) or nil
+	meta.max_points = meta.max_points and tonumber(meta.max_points) or nil
+	meta.no_uniques = meta.no_uniques == "true"
+	meta.enforce_points = meta.enforce_points == "true"
+	return meta
+end
+
+function Api:persistentSnapshots()
+	local directory = self:snapshotsDir()
+	local snapshots = {}
+	for _, path in ipairs(listXmlFiles(directory)) do
+		local name = path:match("([^/]+)%.xml$")
+		if name and not path:sub(#directory + 1):find("/") then
+			local metaFile = io.open(directory .. name .. ".meta", "rb")
+			local meta = metaFile and self:parseSnapshotMeta(metaFile:read("*a")) or {}
+			if metaFile then
+				metaFile:close()
+			end
+			snapshots[#snapshots + 1] = {
+				name = name,
+				path = path,
+				level = meta.level,
+				constraints = meta,
+			}
+		end
+	end
+	table.sort(snapshots, function(a, b)
+		return a.name < b.name
+	end)
+	return snapshots
+end
+
+function Api:snapshotList(options)
+	options = options or {}
+	local snapshots = {}
+	local byName = {}
+	for name in pairs(self.snapshots) do
+		byName[name] = { name = name, persistent = false }
+	end
+	for _, entry in ipairs(self:persistentSnapshots()) do
+		byName[entry.name] = {
+			name = entry.name,
+			persistent = true,
+			path = entry.path,
+			level = entry.level,
+			constraints = entry.constraints,
+		}
+	end
+	for _, entry in pairs(byName) do
+		snapshots[#snapshots + 1] = entry
+	end
+	table.sort(snapshots, function(a, b)
+		return a.name < b.name
+	end)
+	return {
+		total = #snapshots,
+		snapshots = snapshots,
+	}
+end
+
+function Api:snapshotDelete(options)
+	options = options or {}
+	if not options.name then
+		error("snapshot_delete requires name", 0)
+	end
+	local name = options.name
+	local xmlPath = self:snapshotPath(name)
+	local metaPath = self:snapshotMetaPath(name)
+	local file = io.open(xmlPath, "rb")
+	local persisted = file ~= nil
+	if file then
+		file:close()
+		local removed, err = os.remove(xmlPath)
+		if not removed then
+			error("Could not delete persistent snapshot: " .. tostring(err), 0)
+		end
+	end
+	os.remove(metaPath)
+	local inMemory = self.snapshots[name] ~= nil
+	if not persisted and not inMemory then
+		error("Unknown snapshot '" .. tostring(name) .. "'", 0)
+	end
+	self.snapshots[name] = nil
+	self.snapshotConstraints[name] = nil
+	return {
+		name = name,
+		deleted = true,
+		persistent = persisted,
+		memory = inMemory,
+	}
 end
 
 function Api:characterSet(options)
@@ -1348,18 +1930,130 @@ function Api:findGem(name)
 	return gemData
 end
 
+function Api:resolveEditableSkillGroup(value)
+	local index = tonumber(value)
+	local group = index and self:getBuild().skillsTab.socketGroupList[index]
+	if not group then
+		error("Unknown skill group '" .. tostring(value) .. "'", 0)
+	end
+	if group.source then
+		error("Skill groups granted by items or the tree cannot be edited", 0)
+	end
+	return group, index
+end
+
+function Api:makeGemInstance(gemInput)
+	local name = gemInput.name
+	if type(name) ~= "string" or name == "" then
+		error("Every gem needs a name", 0)
+	end
+	local gemData, err = self:findGem(name)
+	if not gemData then
+		error(err, 0)
+	end
+	return {
+		nameSpec = gemData.name,
+		gemId = gemData.id,
+		skillId = gemData.grantedEffectId,
+		level = util.clamp(math.floor(tonumber(gemInput.level) or 20), 1, 40),
+		quality = util.clamp(math.floor(tonumber(gemInput.quality) or 0), 0, 100),
+		enabled = gemInput.enabled ~= false,
+		count = math.max(1, math.floor(tonumber(gemInput.count) or 1)),
+		enableGlobal1 = gemInput.enable_global_1 ~= false,
+		enableGlobal2 = gemInput.enable_global_2 ~= false,
+	}
+end
+
+function Api:clampSkillGroupIndexes(group)
+	local skillList = group.displaySkillList or {}
+	group.mainActiveSkill = util.clamp(math.floor(tonumber(group.mainActiveSkill) or 1), 1, math.max(1, #skillList))
+	local calcsList = group.displaySkillListCalcs or skillList
+	group.mainActiveSkillCalcs = util.clamp(math.floor(tonumber(group.mainActiveSkillCalcs) or group.mainActiveSkill), 1, math.max(1, #calcsList))
+end
+
+function Api:skillSlotDiagnostics(group)
+	local build = self:getBuild()
+	local slot = group.slot
+	if not slot then
+		return nil
+	end
+	local slotControl = build.itemsTab.slots[slot]
+	local item = slotControl and build.itemsTab.items[slotControl.selItemId]
+	if not item then
+		return {
+			slot = slot,
+			item_id = nil,
+			item_name = nil,
+			sockets = nil,
+		}
+	end
+	local info = socketInfo(item)
+	info.slot = slot
+	info.item_id = item.id
+	info.item_name = item.name or item.baseName
+	info.socket_string = socketString(item)
+	info.groups = {}
+	local offset = 0
+	for index, other in ipairs(build.skillsTab.socketGroupList) do
+		if other.slot == slot then
+			if other == group then
+				local colors = {}
+				local mismatches = {}
+				local socketIndex = 0
+				for _, gem in ipairs(group.gemList or {}) do
+					if gem.gemData or gem.grantedEffect then
+						socketIndex = socketIndex + 1
+						local granted = gem.grantedEffect or gem.gemData.grantedEffect
+						local color = granted and granted.color
+						local expected = color == 1 and "R" or color == 2 and "G" or color == 3 and "B" or "W"
+						local socket = item.sockets and item.sockets[offset + socketIndex]
+						colors[#colors + 1] = {
+							gem = gem.nameSpec or (gem.gemData and gem.gemData.name),
+							expected = expected,
+							actual = socket and socket.color or nil,
+							matches = socket and (item.sockets.colourAlwaysMatches or socket.color == expected) or false,
+						}
+						if socket and not (item.sockets.colourAlwaysMatches or socket.color == expected) then
+							mismatches[#mismatches + 1] = expected .. "->" .. socket.color
+						end
+					end
+				end
+				info.groups[#info.groups + 1] = {
+					index = index,
+					offset = offset,
+					colors = colors,
+					mismatches = mismatches,
+				}
+				break
+			end
+			offset = offset + #(other.gemList or {})
+		end
+	end
+	return info
+end
+
 function Api:skillsGet()
 	local build = self:getBuild()
 	local output = {}
 	for index, group in ipairs(build.skillsTab.socketGroupList) do
 		local gems = {}
 		for _, gem in ipairs(group.gemList or {}) do
+			local granted = gem.grantedEffect or (gem.gemData and gem.gemData.grantedEffect)
 			gems[#gems + 1] = {
 				name = gem.nameSpec or (gem.gemData and gem.gemData.name),
+				gem_id = gem.gemData and gem.gemData.id,
+				skill_id = gem.skillId,
 				level = gem.level,
 				quality = gem.quality,
 				enabled = gem.enabled ~= false,
 				count = gem.count or 1,
+				color = granted and (granted.color == 1 and "R" or granted.color == 2 and "G" or granted.color == 3 and "B" or "W") or nil,
+				matches_socket = gem.matchesSocket,
+				req_level = gem.reqLevel,
+				req_str = gem.reqStr,
+				req_dex = gem.reqDex,
+				req_int = gem.reqInt,
+				err_msg = gem.errMsg,
 			}
 		end
 		output[#output + 1] = {
@@ -1370,11 +2064,19 @@ function Api:skillsGet()
 			enabled = group.enabled ~= false,
 			is_main = index == (build.mainSocketGroup or 1),
 			main_active = group.mainActiveSkill or 1,
+			main_active_calcs = group.mainActiveSkillCalcs,
+			include_in_full_dps = group.includeInFullDPS == true,
+			group_count = group.groupCount,
+			source = group.source,
+			slot_enabled = group.slotEnabled ~= false,
+			imbued_support = group.imbuedSupport,
 			gems = gems,
+			socket_diagnostics = self:skillSlotDiagnostics(group),
 		}
 	end
 	return {
 		main_group = build.mainSocketGroup or 1,
+		slots = groupSlotOrder,
 		groups = output,
 	}
 end
@@ -1394,33 +2096,16 @@ function Api:skillsAddGroup(options)
 		label = options.label or "",
 		slot = options.slot,
 		enabled = options.enabled ~= false,
+		includeInFullDPS = options.include_in_full_dps == true,
+		groupCount = tonumber(options.group_count),
 		gemList = {},
 		mainActiveSkill = 1,
 	}
 	for _, gemInput in ipairs(gems) do
-		local name = gemInput.name
-		if type(name) ~= "string" or name == "" then
-			error("Every gem needs a name", 0)
-		end
-		local gemData, err = self:findGem(name)
-		if not gemData then
-			error(err, 0)
-		end
-		local level = util.clamp(math.floor(tonumber(gemInput.level) or 20), 1, 40)
-		local quality = util.clamp(math.floor(tonumber(gemInput.quality) or 0), 0, 100)
-		local count = math.max(1, math.floor(tonumber(gemInput.count) or 1))
-		group.gemList[#group.gemList + 1] = {
-			nameSpec = gemData.name,
-			gemId = gemData.id,
-			skillId = gemData.grantedEffectId,
-			level = level,
-			quality = quality,
-			enabled = gemInput.enabled ~= false,
-			count = count,
-			enableGlobal1 = true,
-			enableGlobal2 = true,
-		}
-		if not (gemData.tags and gemData.tags.support == true) then
+		local gem = self:makeGemInstance(gemInput)
+		group.gemList[#group.gemList + 1] = gem
+		local gemData = self:findGem(gemInput.name)
+		if gemData and not (gemData.tags and gemData.tags.support == true) then
 			hasActive = true
 		end
 	end
@@ -1440,6 +2125,108 @@ function Api:skillsAddGroup(options)
 		group = self:skillsGet().groups[afterCount],
 		state = self:skillsGet(),
 	}
+end
+
+function Api:skillsUpdateGroup(options)
+	options = options or {}
+	local build = self:getBuild()
+	local group, index = self:resolveEditableSkillGroup(options.group)
+	if options.label ~= nil then
+		group.label = tostring(options.label)
+	end
+	if options.enabled ~= nil then
+		group.enabled = options.enabled == true
+	end
+	if options.include_in_full_dps ~= nil then
+		group.includeInFullDPS = options.include_in_full_dps == true
+	end
+	if options.group_count ~= nil then
+		group.groupCount = tonumber(options.group_count)
+	end
+	if options.imbued_support ~= nil then
+		if options.imbued_support == "" then
+			group.imbuedSupport = nil
+		else
+			group.imbuedSupport = tostring(options.imbued_support)
+		end
+	end
+	if options.slot ~= nil then
+		local slot = options.slot
+		if slot == "" or slot == "None" then
+			slot = nil
+		elseif not groupSlots[slot] then
+			error("Unknown skill group slot '" .. tostring(slot) .. "'", 0)
+		end
+		group.slot = slot
+	end
+	if options.set_main == true then
+		build.mainSocketGroup = index
+	end
+	build.skillsTab:ProcessSocketGroup(group)
+	build.skillsTab:RebuildImbuedSupportBySlot()
+	self:frame()
+	return self:skillsGet().groups[index]
+end
+
+function Api:skillsSetSlot(options)
+	options = options or {}
+	local group, index = self:resolveEditableSkillGroup(options.group)
+	local slot = options.slot
+	if slot == "" or slot == "None" then
+		slot = nil
+	elseif slot ~= nil and not groupSlots[slot] then
+		error("Unknown skill group slot '" .. tostring(slot) .. "'", 0)
+	end
+	group.slot = slot
+	self:getBuild().skillsTab:RebuildImbuedSupportBySlot()
+	self:frame()
+	return self:skillsGet().groups[index]
+end
+
+function Api:skillsAddGem(options)
+	options = options or {}
+	local group, index = self:resolveEditableSkillGroup(options.group)
+	local gem = self:makeGemInstance(options.gem or {})
+	local position = tonumber(options.position)
+	if position then
+		table.insert(group.gemList, util.clamp(math.floor(position), 1, #group.gemList + 1), gem)
+	else
+		group.gemList[#group.gemList + 1] = gem
+	end
+	self:getBuild().skillsTab:ProcessSocketGroup(group)
+	self:clampSkillGroupIndexes(group)
+	self:frame()
+	return self:skillsGet().groups[index]
+end
+
+function Api:skillsRemoveGem(options)
+	options = options or {}
+	local group, index = self:resolveEditableSkillGroup(options.group)
+	local gemIndex = tonumber(options.gem)
+	if not gemIndex or not group.gemList[gemIndex] then
+		error("Unknown gem index '" .. tostring(options.gem) .. "'", 0)
+	end
+	table.remove(group.gemList, gemIndex)
+	self:getBuild().skillsTab:ProcessSocketGroup(group)
+	self:clampSkillGroupIndexes(group)
+	self:frame()
+	return self:skillsGet().groups[index]
+end
+
+function Api:skillsSetGems(options)
+	options = options or {}
+	local group, index = self:resolveEditableSkillGroup(options.group)
+	if type(options.gems) ~= "table" then
+		error("skills_set_gems requires a gems array", 0)
+	end
+	group.gemList = {}
+	for _, gemInput in ipairs(options.gems) do
+		group.gemList[#group.gemList + 1] = self:makeGemInstance(gemInput)
+	end
+	self:getBuild().skillsTab:ProcessSocketGroup(group)
+	self:clampSkillGroupIndexes(group)
+	self:frame()
+	return self:skillsGet().groups[index]
 end
 
 function Api:skillsRemoveGroup(options)
@@ -1566,6 +2353,88 @@ function Api:itemsSearchUniques(options)
 	}
 end
 
+
+function Api:itemsSearchTemplates(options)
+	options = options or {}
+	local query = util.lower(util.trim(tostring(options.query or "")))
+	local baseFilter = options.base and util.lower(tostring(options.base)) or nil
+	local slotFilter = options.slot and util.lower(tostring(options.slot)) or nil
+	local limit = util.clamp(tonumber(options.limit) or 20, 1, 100)
+	local offset = math.max(0, tonumber(options.offset) or 0)
+	local includeRaw = options.include_raw == true
+	local matches = {}
+	for _, item in pairs(self.env.main.rareDB.list or {}) do
+		local include = true
+		if baseFilter then
+			include = util.lower(item.baseName or "") == baseFilter
+		end
+		if include and slotFilter then
+			local primarySlot = util.lower(item:GetPrimarySlot())
+			include = primarySlot == slotFilter or primarySlot:gsub(" %d+$", "") == slotFilter
+		end
+		if include and query ~= "" then
+			local modLines = {}
+			for _, line in ipairs(item.explicitModLines or {}) do
+				modLines[#modLines + 1] = line.line
+			end
+			local searchable = util.lower(table.concat({ item.name or "", item.title or "", item.baseName or "", table.concat(modLines, "\n") }, "\n"))
+			include = searchable:find(query, 1, true) ~= nil
+		end
+		if include then
+			matches[#matches + 1] = item
+		end
+	end
+	table.sort(matches, function(a, b)
+		return util.lower(a.name or "") < util.lower(b.name or "")
+	end)
+	local output = {}
+	for index = offset + 1, math.min(#matches, offset + limit) do
+		local item = matches[index]
+		local entry = {
+			name = item.name,
+			title = item.title,
+			base = item.baseName,
+			type = item.type,
+			primary_slot = item:GetPrimarySlot(),
+			item_level = item.itemLevel,
+		}
+		if includeRaw then
+			entry.raw = item:BuildRaw()
+		end
+		output[#output + 1] = entry
+	end
+	return {
+		total = #matches,
+		offset = offset,
+		limit = limit,
+		templates = output,
+	}
+end
+
+function Api:itemsAddTemplate(options)
+	options = options or {}
+	local query = util.lower(util.trim(tostring(options.name or options.title or "")))
+	if query == "" then
+		error("items_add_template requires name", 0)
+	end
+	local found
+	for _, item in pairs(self.env.main.rareDB.list or {}) do
+		if util.lower(item.name or "") == query or util.lower(item.title or "") == query then
+			found = item
+			break
+		end
+	end
+	if not found then
+		error("Unknown rare template '" .. tostring(options.name or options.title) .. "'. Use items_search_templates.", 0)
+	end
+	return self:itemsAddRaw({
+		raw = found:BuildRaw(),
+		slot = options.slot,
+		equip = options.equip,
+		allow_requirement_violation = options.allow_requirement_violation,
+	})
+end
+
 function Api:itemsSearchBases(options)
 	options = options or {}
 	local build = self:getBuild()
@@ -1621,6 +2490,26 @@ function Api:itemSummary(item)
 		quality = item.quality,
 		variant = item.variant,
 		socket_count = item.sockets and #item.sockets or 0,
+		corrupted = item.corrupted == true,
+		influences = (function()
+			local influences = {}
+			for _, info in ipairs(itemLib.influenceInfo.all) do
+				if item[info.key] then
+					influences[#influences + 1] = info.key
+				end
+			end
+			return influences
+		end)(),
+		anoints = (function()
+			local anoints = {}
+			for _, line in ipairs(item.enchantModLines or {}) do
+				local name = line.line and line.line:match("^Allocates (.+)$")
+				if name then
+					anoints[#anoints + 1] = name
+				end
+			end
+			return anoints
+		end)(),
 	}
 	return output
 end
@@ -1788,6 +2677,191 @@ function Api:itemsAddUnique(options)
 	})
 end
 
+function Api:baseItemForSearch(options)
+	local base = options.base
+	if type(base) ~= "string" or base == "" then
+		error("A base item name is required", 0)
+	end
+	local item = new("Item"):Item("Rarity: RARE\nSearch\n" .. base .. "\nImplicits: 0")
+	if not item.base then
+		error("Unknown base '" .. tostring(base) .. "'", 0)
+	end
+	item.itemLevel = tonumber(options.item_level)
+	if options.influences then
+		local valid = {}
+		for _, info in ipairs(itemLib.influenceInfo.all) do
+			valid[info.key] = true
+		end
+		local seen = {}
+		local count = 0
+		for _, key in ipairs(options.influences) do
+			if not valid[key] then
+				error("Unknown influence '" .. tostring(key) .. "'", 0)
+			end
+			if not seen[key] then
+				seen[key] = true
+				count = count + 1
+				item[key] = true
+			end
+		end
+		if count > 2 then
+			error("An item may have at most two influences", 0)
+		end
+		if count > 0 and not item.canBeInfluenced then
+			error("Item cannot be influenced", 0)
+		end
+	end
+	return item
+end
+
+function Api:itemsSearchMods(options)
+	options = options or {}
+	local item = self:baseItemForSearch(options)
+	local modType = options.type and util.lower(tostring(options.type)) or nil
+	local query = util.lower(util.trim(tostring(options.query or "")))
+	local limit = util.clamp(tonumber(options.limit) or 30, 1, 100)
+	local offset = math.max(0, tonumber(options.offset) or 0)
+	local matches = {}
+	for modId, mod in pairs(item.affixes) do
+		local include = not item:CheckIfModIsDelve(mod) and item:CanHaveMod(mod)
+		if include and modType then
+			include = util.lower(mod.type or "") == modType
+		end
+		if include and query ~= "" then
+			local searchable = util.lower(table.concat({ modId, mod.affix or "", mod.type or "", table.concat(mod, "\n") }, "\n"))
+			include = searchable:find(query, 1, true) ~= nil
+		end
+		if include then
+			matches[#matches + 1] = { id = modId, mod = mod }
+		end
+	end
+	table.sort(matches, function(a, b)
+		local aOrder = a.mod.statOrder and a.mod.statOrder[1] or 0
+		local bOrder = b.mod.statOrder and b.mod.statOrder[1] or 0
+		if aOrder ~= bOrder then
+			return aOrder < bOrder
+		end
+		if (a.mod.level or 0) ~= (b.mod.level or 0) then
+			return (a.mod.level or 0) < (b.mod.level or 0)
+		end
+		return a.id < b.id
+	end)
+	local output = {}
+	for index = offset + 1, math.min(#matches, offset + limit) do
+		local entry = matches[index]
+		local mod = entry.mod
+		local lines = {}
+		for _, line in ipairs(mod) do
+			lines[#lines + 1] = line
+		end
+		output[#output + 1] = {
+			mod_id = entry.id,
+			type = mod.type,
+			affix = mod.affix,
+			group = mod.group,
+			level = mod.level,
+			weight = item:GetModSpawnWeight(mod),
+			stat_order = mod.statOrder,
+			lines = lines,
+			available_at_item_level = not item.itemLevel or not mod.level or mod.level <= item.itemLevel,
+		}
+	end
+	return {
+		base = item.baseName,
+		total = #matches,
+		offset = offset,
+		limit = limit,
+		mods = output,
+	}
+end
+
+function Api:findAffixMod(item, reference, affixType)
+	local mod = item.affixes[reference]
+	if mod then
+		return reference, mod
+	end
+	local target = util.lower(util.trim(tostring(reference or "")))
+	local foundId
+	local found
+	local foundCount = 0
+	for modId, candidate in pairs(item.affixes) do
+		if util.lower(candidate.affix or "") == target and (not affixType or candidate.type == affixType) then
+			foundId = modId
+			found = candidate
+			foundCount = foundCount + 1
+		end
+	end
+	if foundCount > 1 then
+		error("Ambiguous affix '" .. tostring(reference) .. "'; use a mod_id", 0)
+	end
+	return foundId, found
+end
+
+function Api:validateRareOptions(options)
+	options = options or {}
+	local item = self:baseItemForSearch(options)
+	local errors = {}
+	local warnings = {}
+	local selected = {}
+	local selectedGroups = {}
+	local perSideLimit = ((item.type == "Jewel" and not (item.base.subType == "Abyss" and item.corrupted)) or item.type == "Graft") and 2 or 3
+	local function validateList(list, affixType)
+		if #list > perSideLimit then
+			errors[#errors + 1] = string.format("Too many %ss: %d (maximum %d)", affixType:lower(), #list, perSideLimit)
+		end
+		for _, affix in ipairs(list) do
+			local reference = affix.mod_id or affix.line
+			local modId, mod
+			if reference then
+				modId, mod = self:findAffixMod(item, reference, affixType)
+			end
+			if not mod then
+				errors[#errors + 1] = "Unknown " .. affixType:lower() .. " '" .. tostring(reference) .. "'"
+			else
+				if mod.type ~= affixType then
+					errors[#errors + 1] = string.format("Modifier '%s' is a %s, not a %s", reference, mod.type or "modifier", affixType)
+				end
+				if item:CheckIfModIsDelve(mod) then
+					errors[#errors + 1] = string.format("Delve modifier '%s' is not part of normal rare crafting", reference)
+				elseif not item:CanHaveMod(mod) then
+					errors[#errors + 1] = string.format("Modifier '%s' cannot appear on %s", reference, item.baseName)
+				end
+				if mod.group and selectedGroups[mod.group] then
+					errors[#errors + 1] = string.format("Modifier '%s' duplicates affix group '%s'", reference, mod.group)
+				end
+				if mod.group then
+					selectedGroups[mod.group] = true
+				end
+				if item.itemLevel and mod.level and mod.level > item.itemLevel then
+					warnings[#warnings + 1] = string.format("Modifier '%s' requires level %d but item level is %d", reference, mod.level, item.itemLevel)
+				end
+				selected[#selected + 1] = { modId = modId, mod = mod, range = affix.range }
+			end
+		end
+	end
+	validateList(options.prefixes or {}, "Prefix")
+	validateList(options.suffixes or {}, "Suffix")
+	return {
+		item = item,
+		valid = #errors == 0,
+		errors = errors,
+		warnings = warnings,
+		affixes = selected,
+	}
+end
+
+function Api:itemsValidateRare(options)
+	local validation = self:validateRareOptions(options)
+	return {
+		valid = validation.valid,
+		base = validation.item.baseName,
+		item_level = validation.item.itemLevel,
+		errors = validation.errors,
+		warnings = validation.warnings,
+		affix_count = #validation.affixes,
+	}
+end
+
 function Api:itemsAddRare(options)
 	options = options or {}
 	local build = self:getBuild()
@@ -1813,6 +2887,70 @@ function Api:itemsAddRare(options)
 		end
 		error(message .. ". Use items_search_bases.", 0)
 	end
+	local hasPrefixes = type(options.prefixes) == "table" and #options.prefixes > 0
+	local hasSuffixes = type(options.suffixes) == "table" and #options.suffixes > 0
+	local hasStructured = hasPrefixes or hasSuffixes
+	local hasRawMods = (type(options.mods) == "string" and #options.mods > 0)
+		or (type(options.mods) == "table" and #options.mods > 0)
+	if hasStructured and hasRawMods then
+		error("items_add_rare accepts either mods or prefixes/suffixes, not both", 0)
+	end
+	if hasStructured then
+		local validation = self:validateRareOptions(options)
+		if not validation.valid then
+			error(table.concat(validation.errors, "; "), 0)
+		end
+		local lines = {
+			"Rarity: RARE",
+			tostring(options.name or "MCP Rare"),
+			base,
+		}
+		for _, info in ipairs(itemLib.influenceInfo.all) do
+			if validation.item[info.key] then
+				lines[#lines + 1] = info.display .. " Item"
+			end
+		end
+		if options.item_level then
+			lines[#lines + 1] = "Item Level: " .. tostring(math.floor(tonumber(options.item_level) or 0))
+		end
+		if options.quality then
+			lines[#lines + 1] = "Quality: " .. tostring(math.floor(tonumber(options.quality) or 0))
+		end
+		if options.sockets and options.sockets ~= "" then
+			lines[#lines + 1] = "Sockets: " .. tostring(options.sockets)
+		end
+		lines[#lines + 1] = "Implicits: 0"
+		local item = new("Item"):Item(table.concat(lines, "\n"))
+		local perSideLimit = ((item.type == "Jewel" and not (item.base.subType == "Abyss" and item.corrupted)) or item.type == "Graft") and 2 or 3
+		item.crafted = true
+		item.affixLimit = perSideLimit * 2
+		item.prefixes = { limit = perSideLimit }
+		item.suffixes = { limit = perSideLimit }
+		for index = 1, perSideLimit do
+			item.prefixes[index] = { modId = "None" }
+			item.suffixes[index] = { modId = "None" }
+		end
+		local prefixIndex = 0
+		local suffixIndex = 0
+		for _, entry in ipairs(validation.affixes) do
+			if entry.mod.type == "Prefix" then
+				prefixIndex = prefixIndex + 1
+				item.prefixes[prefixIndex] = { modId = entry.modId, range = tonumber(entry.range) or 0.5 }
+			else
+				suffixIndex = suffixIndex + 1
+				item.suffixes[suffixIndex] = { modId = entry.modId, range = tonumber(entry.range) or 0.5 }
+			end
+		end
+		item:Craft()
+		local summary = self:itemsAddRaw({
+			raw = item:BuildRaw(),
+			slot = options.slot,
+			equip = options.equip,
+			allow_requirement_violation = options.allow_requirement_violation,
+		})
+		summary.warnings = validation.warnings
+		return summary
+	end
 	local mods = options.mods
 	local modLines = {}
 	if type(mods) == "string" then
@@ -1829,6 +2967,14 @@ function Api:itemsAddRare(options)
 		tostring(options.name or "MCP Rare"),
 		base,
 	}
+	if options.influences then
+		local validated = self:baseItemForSearch({ base = base, influences = options.influences })
+		for _, info in ipairs(itemLib.influenceInfo.all) do
+			if validated[info.key] then
+				lines[#lines + 1] = info.display .. " Item"
+			end
+		end
+	end
 	if options.item_level then
 		lines[#lines + 1] = "Item Level: " .. tostring(math.floor(tonumber(options.item_level) or 0))
 	end
@@ -1888,6 +3034,7 @@ function Api:itemsGet(options)
 				name = slot.slotName,
 				label = slot.label,
 				item_id = slot.selItemId ~= 0 and slot.selItemId or nil,
+				active = slot.active == true,
 			}
 		end
 	end
@@ -1895,6 +3042,114 @@ function Api:itemsGet(options)
 		items = items,
 		equipped = equipped,
 		slots = slots,
+	}
+end
+
+function Api:getItem(itemId)
+	local id = tonumber(itemId)
+	local item = id and self:getBuild().itemsTab.items[id]
+	if not item then
+		error("Unknown item id '" .. tostring(itemId) .. "'", 0)
+	end
+	return item
+end
+
+function Api:replaceItem(item)
+	local build = self:getBuild()
+	local itemsTab = build.itemsTab
+	itemsTab:AddItem(item, true)
+	itemsTab:PopulateSlots()
+	itemsTab:UpdateSockets()
+	itemsTab:AddUndoState()
+	build.buildFlag = true
+	self:frame()
+	return self:itemSummary(item)
+end
+
+function Api:itemsSetSockets(options)
+	options = options or {}
+	local item = self:getItem(options.item_id)
+	if not item.base or not item.base.socketLimit then
+		error("Item does not support sockets", 0)
+	end
+	local sockets = parseSocketString(options.sockets)
+	local normalSockets = 0
+	local abyssalSockets = 0
+	for _, socket in ipairs(sockets) do
+		if socket.color == "A" then
+			abyssalSockets = abyssalSockets + 1
+		else
+			normalSockets = normalSockets + 1
+		end
+	end
+	local requiredAbyssal = math.max(abyssalSockets, item.abyssalSocketCount or 0)
+	local normalCapacity = math.max(0, item.base.socketLimit - requiredAbyssal)
+	if normalSockets > normalCapacity then
+		error(string.format("Item allows at most %d normal sockets with %d abyssal sockets", normalCapacity, requiredAbyssal), 0)
+	end
+	local clone = new("Item"):Item(item:BuildRaw())
+	clone.id = item.id
+	clone.sockets = sockets
+	clone:BuildAndParseRaw()
+	return self:replaceItem(clone)
+end
+
+function Api:itemsOptimiseSockets(options)
+	options = options or {}
+	local build = self:getBuild()
+	local item = self:getItem(options.item_id)
+	if not item.base or not item.base.socketLimit then
+		error("Item does not support sockets", 0)
+	end
+	local slotName = options.slot
+	if not slotName then
+		for _, slot in ipairs(build.itemsTab.orderedSlots) do
+			if slot.selItemId == item.id then
+				slotName = slot.slotName
+				break
+			end
+		end
+	end
+	if not slotName then
+		error("Item is not equipped; pass slot to optimise sockets", 0)
+	end
+	if not groupSlots[slotName] then
+		error("Unknown skill group slot '" .. tostring(slotName) .. "'", 0)
+	end
+	local oldInfo = socketInfo(item)
+	local maxSockets = (item.base and item.base.socketLimit or 0) - oldInfo.abyssal
+	if maxSockets < 0 then
+		maxSockets = 0
+	end
+	local sockets = {}
+	local groupId = 0
+	local colours = { "R", "G", "B" }
+	for _, group in ipairs(build.skillsTab.socketGroupList) do
+		if group.slot == slotName then
+			for _, gem in ipairs(group.gemList or {}) do
+				local granted = gem.grantedEffect or (gem.gemData and gem.gemData.grantedEffect)
+				if granted and maxSockets > 0 then
+					local color = granted.color and colours[granted.color] or "W"
+					sockets[#sockets + 1] = { color = color, group = groupId }
+					maxSockets = maxSockets - 1
+				end
+			end
+			groupId = groupId + 1
+		end
+	end
+	for _ = 1, oldInfo.abyssal do
+		groupId = groupId + 1
+		sockets[#sockets + 1] = { color = "A", group = groupId }
+	end
+	local clone = new("Item"):Item(item:BuildRaw())
+	clone.id = item.id
+	clone.sockets = sockets
+	clone:BuildAndParseRaw()
+	local summary = self:replaceItem(clone)
+	return {
+		item = summary,
+		sockets = socketString(clone),
+		socket_diagnostics = socketInfo(clone),
 	}
 end
 
@@ -1911,6 +3166,219 @@ function Api:itemsEquip(options)
 	local summary = self:itemSummary(item)
 	summary.equipped_in = slot
 	return summary
+end
+
+function Api:maxEnchantSlots(item)
+	if item.canHaveFourEnchants then
+		return 4
+	elseif item.canHaveThreeEnchants then
+		return 3
+	elseif item.canHaveTwoEnchants then
+		return 2
+	end
+	return 1
+end
+
+function Api:resolveNotable(reference)
+	local build = self:getBuild()
+	local node
+	if type(reference) == "number" or (type(reference) == "string" and tonumber(reference)) then
+		node = build.spec.tree.nodes[tonumber(reference)]
+	else
+		local name = util.lower(util.trim(tostring(reference or "")))
+		node = build.spec.tree.notableMap[name] or build.spec.tree.ascendancyMap[name]
+	end
+	if not node then
+		error("Unknown notable '" .. tostring(reference) .. "'", 0)
+	end
+	if not node.recipe then
+		error("Passive '" .. tostring(node.dn or node.name) .. "' cannot be anointed", 0)
+	end
+	return node
+end
+
+function Api:isAnointableItem(item)
+	return item and item.base and not item.base.cannotBeAnointed
+		and item.base.subType ~= "Talisman"
+		and (item.canBeAnointed or item.base.type == "Amulet")
+end
+
+function Api:itemsAnoint(options)
+	options = options or {}
+	local item = self:getItem(options.item_id)
+	if not self:isAnointableItem(item) then
+		error("Item is not anointable", 0)
+	end
+	local clone = new("Item"):Item(item:BuildRaw())
+	clone.id = item.id
+	local function removeAnointLines(lines)
+		for index = #lines, 1, -1 do
+			if lines[index].line and lines[index].line:match("^Allocates ") then
+				table.remove(lines, index)
+			end
+		end
+	end
+	removeAnointLines(clone.enchantModLines)
+	removeAnointLines(clone.implicitModLines)
+	if not options.remove then
+		local node = self:resolveNotable(options.notable or options.node_id or options.node_name)
+		local slot = util.clamp(math.floor(tonumber(options.slot) or 1), 1, self:maxEnchantSlots(clone))
+		local position = math.min(slot, #clone.enchantModLines + 1)
+		table.insert(clone.enchantModLines, position, { crafted = true, line = "Allocates " .. node.dn })
+	end
+	clone:BuildAndParseRaw()
+	local summary = self:replaceItem(clone)
+	summary.anoints = self:itemSummary(clone).anoints
+	return summary
+end
+
+function Api:itemsSetEnchant(options)
+	options = options or {}
+	local item = self:getItem(options.item_id)
+	local clone = new("Item"):Item(item:BuildRaw())
+	clone.id = item.id
+	local slot = util.clamp(math.floor(tonumber(options.slot) or 1), 1, self:maxEnchantSlots(clone))
+	if options.remove == true then
+		if clone.enchantModLines[slot] then
+			table.remove(clone.enchantModLines, slot)
+		end
+	else
+		local line = options.line
+		if type(line) ~= "string" or line == "" then
+			error("items_set_enchant requires line or remove=true", 0)
+		end
+		if clone.enchantModLines[slot] then
+			table.remove(clone.enchantModLines, slot)
+		end
+		local position = math.min(slot, #clone.enchantModLines + 1)
+		table.insert(clone.enchantModLines, position, { crafted = true, line = line })
+	end
+	clone:BuildAndParseRaw()
+	return self:replaceItem(clone)
+end
+
+function Api:itemsSetInfluences(options)
+	options = options or {}
+	local item = self:getItem(options.item_id)
+	if not item.canBeInfluenced then
+		error("Item cannot be influenced", 0)
+	end
+	local requested = options.influences
+	if type(requested) ~= "table" then
+		error("items_set_influences requires influences; pass an empty array to clear", 0)
+	end
+	local valid = {}
+	for _, info in ipairs(itemLib.influenceInfo.all) do
+		valid[info.key] = true
+	end
+	local seen = {}
+	local keys = {}
+	for _, key in ipairs(requested) do
+		if not valid[key] then
+			error("Unknown influence '" .. tostring(key) .. "'", 0)
+		end
+		if not seen[key] then
+			seen[key] = true
+			keys[#keys + 1] = key
+		end
+	end
+	if #keys > 2 then
+		error("An item may have at most two influences", 0)
+	end
+	local clone = new("Item"):Item(item:BuildRaw())
+	clone.id = item.id
+	clone:ResetInfluence()
+	for _, key in ipairs(keys) do
+		clone[key] = true
+	end
+	clone:BuildAndParseRaw()
+	local summary = self:replaceItem(clone)
+	summary.influences = self:itemSummary(clone).influences
+	return summary
+end
+
+function Api:itemsCorrupt(options)
+	options = options or {}
+	local item = self:getItem(options.item_id)
+	if item.corrupted then
+		error("Item is already corrupted", 0)
+	end
+	if item.corruptible == false then
+		error("Item cannot be corrupted", 0)
+	end
+	local clone = new("Item"):Item(item:BuildRaw())
+	clone.id = item.id
+	clone.corrupted = true
+	if options.implicits ~= nil then
+		if type(options.implicits) ~= "table" then
+			error("implicits must be an array", 0)
+		end
+		local maxImplicits = clone.corruptImplicitCount or 2
+		if #options.implicits > maxImplicits then
+			error(string.format("Item allows at most %d corruption implicits", maxImplicits), 0)
+		end
+		clone.implicitModLines = {}
+		for _, line in ipairs(options.implicits) do
+			clone.implicitModLines[#clone.implicitModLines + 1] = { line = tostring(line) }
+		end
+	end
+	clone:BuildAndParseRaw()
+	return self:replaceItem(clone)
+end
+
+function Api:itemsUpdateRaw(options)
+	options = options or {}
+	local item = self:getItem(options.item_id)
+	if type(options.raw) ~= "string" or options.raw == "" then
+		error("items_update_raw requires raw item text", 0)
+	end
+	local clone = new("Item"):Item(options.raw)
+	if not clone.base then
+		error("Could not parse item text", 0)
+	end
+	clone.id = item.id
+	self:checkItemConstraints(clone, options)
+	return self:replaceItem(clone)
+end
+
+function Api:itemsSetFlaskActive(options)
+	options = options or {}
+	local item = self:getItem(options.item_id)
+	if item.type ~= "Flask" and item.type ~= "Tincture" then
+		error("Item is not a flask or tincture", 0)
+	end
+	local build = self:getBuild()
+	local itemsTab = build.itemsTab
+	local slotName
+	for _, slot in ipairs(itemsTab.orderedSlots) do
+		if slot.selItemId == item.id then
+			slotName = slot.slotName
+			break
+		end
+	end
+	if not slotName then
+		error("Flask is not equipped", 0)
+	end
+	local active = options.active
+	if active == nil then
+		active = not itemsTab.slots[slotName].active
+	else
+		active = active == true
+	end
+	local slot = itemsTab.slots[slotName]
+	slot.active = active
+	itemsTab.activeItemSet[slotName].active = active
+	if slot.controls and slot.controls.activate then
+		slot.controls.activate.state = active
+	end
+	itemsTab:AddUndoState()
+	build.buildFlag = true
+	self:frame()
+	return {
+		item_id = item.id,
+		slot = slotName,
+		active = active,
+	}
 end
 
 function Api:itemsRemove(options)
@@ -2233,7 +3701,8 @@ function Api:calcWhatIf(options)
 	local requested = options.stats or curatedStatKeys
 	result.base_requested = objectMap({})
 	result.result_requested = objectMap({})
-	for _, key in ipairs(requested) do
+	for _, requestedKey in ipairs(requested) do
+		local key = self:resolveStatName(requestedKey)
 		local baseValue = calcBase[key]
 		local resultValue = output[key]
 		if type(baseValue) == "number" or type(resultValue) == "number" then
@@ -2245,8 +3714,8 @@ function Api:calcWhatIf(options)
 	for key in pairs(result.result) do
 		deltaKeys[key] = true
 	end
-	for _, key in ipairs(requested) do
-		deltaKeys[key] = true
+	for _, requestedKey in ipairs(requested) do
+		deltaKeys[self:resolveStatName(requestedKey)] = true
 	end
 	for key in pairs(deltaKeys) do
 		local baseValue = calcBase[key]
@@ -2297,6 +3766,131 @@ function Api:itemsCompare(options)
 	return result
 end
 
+
+function Api:statAliasMap()
+	local build = self:getBuild()
+	local aliases = {}
+	local function add(entry, minion)
+		if not entry or not entry.stat or entry.childStat then
+			return
+		end
+		local stat = entry.stat
+		local labels = { entry.label, stat, tostring(stat):gsub("(%l)(%u)", "%1 %2") }
+		for _, label in ipairs(labels) do
+			local key = normaliseStatText(label)
+			if key ~= "" then
+				local existing = aliases[key]
+				if not existing or existing == stat then
+					aliases[key] = stat
+				else
+					aliases[key] = false
+				end
+			end
+		end
+	end
+	for _, entry in ipairs(build.displayStats or {}) do
+		add(entry, false)
+	end
+	for _, entry in ipairs(build.minionDisplayStats or {}) do
+		add(entry, true)
+	end
+	return aliases
+end
+
+function Api:resolveStatName(name)
+	local build = self:getBuild()
+	local output = build.calcsTab.mainOutput or {}
+	if output[name] ~= nil then
+		return name
+	end
+	for key in pairs(output) do
+		if type(key) == "string" and util.lower(key) == util.lower(name) then
+			return key
+		end
+	end
+	local alias = self:statAliasMap()[normaliseStatText(name)]
+	if alias and output[alias] ~= nil then
+		return alias
+	end
+	return name
+end
+
+function Api:statsSearch(options)
+	options = options or {}
+	local build = self:getBuild()
+	local output = build.calcsTab.mainOutput or {}
+	local query = util.lower(util.trim(tostring(options.query or "")))
+	local tokens = {}
+	for token in query:gmatch("%S+") do
+		tokens[#tokens + 1] = token
+	end
+	local curated = {}
+	for _, key in ipairs(curatedStatKeys) do
+		curated[key] = true
+	end
+	local labels = {}
+	for _, entry in ipairs(build.displayStats or {}) do
+		if entry.stat and entry.label and not entry.childStat then
+			labels[entry.stat] = labels[entry.stat] or {}
+			labels[entry.stat][#labels[entry.stat] + 1] = entry.label
+		end
+	end
+	local matches = {}
+	for key, value in pairs(output) do
+		if type(key) == "string" and (type(value) == "number" or type(value) == "boolean") then
+			local parts = { key }
+			for _, label in ipairs(labels[key] or {}) do
+				parts[#parts + 1] = label
+			end
+			local haystack = util.lower(table.concat(parts, " "))
+			local score = 0
+			local matched = true
+			for _, token in ipairs(tokens) do
+				local ok, tokenScore = fuzzyStatMatch(haystack, token)
+				if not ok then
+					matched = false
+					break
+				end
+				score = score + tokenScore
+			end
+			if matched then
+				if query ~= "" and haystack:find(query, 1, true) then
+					score = score + 500
+				end
+				if curated[key] then
+					score = score + 100
+				end
+				matches[#matches + 1] = { key = key, labels = labels[key] or {}, score = score, value = value }
+			end
+		end
+	end
+	table.sort(matches, function(a, b)
+		if a.score ~= b.score then
+			return a.score > b.score
+		end
+		return a.key < b.key
+	end)
+	local limit = util.clamp(tonumber(options.limit) or 30, 1, 100)
+	local offset = math.max(0, tonumber(options.offset) or 0)
+	local stats = {}
+	for index = offset + 1, math.min(#matches, offset + limit) do
+		local entry = matches[index]
+		stats[#stats + 1] = {
+			key = entry.key,
+			label = entry.labels[1],
+			labels = entry.labels,
+			curated = curated[entry.key] or false,
+			value = util.sanitize(entry.value),
+		}
+	end
+	return {
+		total = #matches,
+		offset = offset,
+		limit = limit,
+		stats = stats,
+	}
+end
+
 function Api:calcStats(options)
 	options = options or {}
 	local build = self:getBuild()
@@ -2307,13 +3901,18 @@ function Api:calcStats(options)
 	}
 	if options.stats then
 		result.requested = objectMap({})
+		result.aliases = objectMap({})
 		result.missing = {}
-		for _, key in ipairs(options.stats) do
+		for _, requestedKey in ipairs(options.stats) do
+			local key = self:resolveStatName(requestedKey)
 			local value = output[key]
 			if value ~= nil then
 				result.requested[key] = util.sanitize(value)
+				if key ~= requestedKey then
+					result.aliases[requestedKey] = key
+				end
 			else
-				result.missing[#result.missing + 1] = key
+				result.missing[#result.missing + 1] = requestedKey
 			end
 		end
 	end
@@ -2337,10 +3936,11 @@ end
 function Api:calcBreakdown(options)
 	options = options or {}
 	local build = self:getBuild()
-	local stat = options.stat
-	if type(stat) ~= "string" or stat == "" then
+	local requestedStat = options.stat
+	if type(requestedStat) ~= "string" or requestedStat == "" then
 		error("calc_breakdown requires a stat name", 0)
 	end
+	local stat = self:resolveStatName(requestedStat)
 	local actorName = options.actor == "minion" and "minion" or "player"
 	local environment = build.calcsTab.mainEnv
 	local actor = environment and environment[actorName]
@@ -2354,6 +3954,7 @@ function Api:calcBreakdown(options)
 	end
 	return {
 		stat = stat,
+		requested_stat = requestedStat,
 		actor = actorName,
 		value = util.sanitize(value),
 		breakdown = util.sanitize(breakdown, { depth = 6, strip = true }),

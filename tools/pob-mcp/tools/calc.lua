@@ -12,6 +12,16 @@ local defs = {
 		annotations = { readOnlyHint = true },
 	},
 	{
+		name = "stats_search",
+		description = "Search calculated output stat keys by name, display label, or fuzzy text.",
+		inputSchema = S.object({
+			query = S.string("Text to match in stat key or display label"),
+			limit = S.integer("Maximum results", { minimum = 1, maximum = 100 }),
+			offset = S.integer("Result offset", { minimum = 0 }),
+		}),
+		annotations = { readOnlyHint = true },
+	},
+	{
 		name = "calc_what_if",
 		description = "Evaluate passive-node, item, flask, or condition changes without mutating the active build.",
 		inputSchema = S.object({
@@ -49,6 +59,10 @@ local handlers = {}
 
 function handlers.calc_stats(args, ctx)
 	return ctx.api():calcStats(args)
+end
+
+function handlers.stats_search(args, ctx)
+	return ctx.api():statsSearch(args)
 end
 
 function handlers.calc_what_if(args, ctx)

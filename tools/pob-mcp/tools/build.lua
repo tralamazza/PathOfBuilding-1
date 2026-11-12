@@ -46,16 +46,87 @@ local defs = {
 		annotations = { readOnlyHint = true },
 	},
 	{
+		name = "build_list",
+		description = "List PoB build files in the build directory, optionally filtered and scoped to a subdirectory.",
+		inputSchema = S.object({
+			query = S.string("Text to match in build name, class, or ascendancy"),
+			sub_path = S.string("Subdirectory relative to the build root"),
+		}),
+		annotations = { readOnlyHint = true },
+	},
+	{
+		name = "build_load",
+		description = "Load a PoB build file from the build directory.",
+		inputSchema = S.object({
+			name = S.string("Build name without .xml"),
+			path = S.string("Path relative to the build directory"),
+			sub_path = S.string("Subdirectory relative to the build root"),
+			convert = S.boolean("Convert legacy build versions"),
+		}),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "build_rename",
+		description = "Rename a PoB build file in the build directory.",
+		inputSchema = S.object({
+			name = S.string("Source build name without .xml"),
+			path = S.string("Source path relative to the build directory"),
+			new_name = S.string("New build name without .xml"),
+			sub_path = S.string("Destination subdirectory"),
+			overwrite = S.boolean("Overwrite an existing destination"),
+		}, { "new_name" }),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "build_fork",
+		description = "Fork the active build or a build file into a new build file.",
+		inputSchema = S.object({
+			name = S.string("Source build name without .xml"),
+			path = S.string("Source path relative to the build directory"),
+			new_name = S.string("New build name without .xml"),
+			sub_path = S.string("Destination subdirectory"),
+			overwrite = S.boolean("Overwrite an existing destination"),
+			switch = S.boolean("Load the fork after writing, defaults to true"),
+		}, { "new_name" }),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "build_delete",
+		description = "Delete a PoB build file. The active build cannot be deleted.",
+		inputSchema = S.object({
+			name = S.string("Build name without .xml"),
+			path = S.string("Path relative to the build directory"),
+			sub_path = S.string("Subdirectory relative to the build root"),
+		}),
+		annotations = { destructiveHint = true },
+	},
+	{
 		name = "build_snapshot",
-		description = "Save the active build XML under a snapshot name.",
+		description = "Save the active build XML under a snapshot name, optionally to persistent storage.",
 		inputSchema = S.object({
 			name = S.string("Snapshot name; generated when omitted"),
+			persistent = S.boolean("Write the snapshot under the PoB user data directory"),
 		}),
 		annotations = { destructiveHint = false },
 	},
 	{
 		name = "build_restore",
-		description = "Restore a build snapshot saved with build_snapshot.",
+		description = "Restore a snapshot saved with build_snapshot.",
+		inputSchema = S.object({
+			name = S.string("Snapshot name"),
+			persistent = S.boolean("Read from persistent storage when not in memory"),
+		}, { "name" }),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "build_snapshot_list",
+		description = "List in-memory and persistent build snapshots.",
+		inputSchema = S.object(),
+		annotations = { readOnlyHint = true },
+	},
+	{
+		name = "build_snapshot_delete",
+		description = "Delete a snapshot from memory and persistent storage.",
 		inputSchema = S.object({
 			name = S.string("Snapshot name"),
 		}, { "name" }),
@@ -112,8 +183,36 @@ function handlers.build_state(_, ctx)
 	return ctx.api():summary()
 end
 
+function handlers.build_list(args, ctx)
+	return ctx.api():buildList(args)
+end
+
+function handlers.build_load(args, ctx)
+	return ctx.api():buildLoad(args)
+end
+
+function handlers.build_rename(args, ctx)
+	return ctx.api():buildRename(args)
+end
+
+function handlers.build_fork(args, ctx)
+	return ctx.api():buildFork(args)
+end
+
+function handlers.build_delete(args, ctx)
+	return ctx.api():buildDelete(args)
+end
+
 function handlers.build_snapshot(args, ctx)
 	return ctx.api():snapshot(args)
+end
+
+function handlers.build_snapshot_list(_, ctx)
+	return ctx.api():snapshotList()
+end
+
+function handlers.build_snapshot_delete(args, ctx)
+	return ctx.api():snapshotDelete(args)
 end
 
 function handlers.build_restore(args, ctx)

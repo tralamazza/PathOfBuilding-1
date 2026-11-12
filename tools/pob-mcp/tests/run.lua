@@ -520,6 +520,265 @@ test("constraints_and_item_requirements", function()
 	assertTrue(not overBudget.valid, "over-budget builds should be invalid: " .. mcpJson.encode(overBudget.errors))
 end)
 
+
+test("skills_edit_and_sockets", function()
+	api:newBuild({ name = "Skill Edit", class = "Witch", level = 90 })
+	local group = api:skillsAddGroup({
+		gems = {
+			{ name = "Spark", level = 20, quality = 20 },
+			{ name = "Pierce", level = 20, quality = 20 },
+		},
+	})
+	local index = group.group_index
+	local updated = api:skillsUpdateGroup({ group = index, label = "Edited", include_in_full_dps = true, group_count = 2 })
+	assertEqual(updated.label, "Edited")
+	assertEqual(updated.include_in_full_dps, true)
+	assertEqual(updated.group_count, 2)
+	local slotted = api:skillsSetSlot({ group = index, slot = "Helmet" })
+	assertEqual(slotted.slot, "Helmet")
+	local added = api:skillsAddGem({ group = index, gem = { name = "Added Lightning Damage", level = 20, quality = 20 } })
+	assertEqual(#added.gems, 3)
+	local removed = api:skillsRemoveGem({ group = index, gem = 3 })
+	assertEqual(#removed.gems, 2)
+	local replaced = api:skillsSetGems({ group = index, gems = {
+		{ name = "Spark", level = 1, quality = 0 },
+		{ name = "Pierce", level = 1, quality = 0 },
+		{ name = "Added Lightning Damage", level = 1, quality = 0 },
+	} })
+	assertEqual(#replaced.gems, 3)
+	assertEqual(replaced.gems[1].level, 1)
+	local helmet = api:itemsAddRare({
+		base = "Iron Hat",
+		name = "Link Warning",
+		mods = { "+50 to maximum Life" },
+		item_level = 86,
+		sockets = "R-R",
+	})
+	api:skillsSetSlot({ group = index, slot = "Helmet" })
+	local validation = api:validateBuild()
+	assertTrue(validation.valid, "socket issues should be warnings, not errors")
+	local linkWarning = false
+	local capacityWarning = false
+	for _, warning in ipairs(validation.warnings) do
+		if warning.code == "socket_link" then
+			linkWarning = true
+		elseif warning.code == "socket_capacity" then
+			capacityWarning = true
+		end
+	end
+	assertTrue(linkWarning, "expected a socket link warning")
+	assertTrue(capacityWarning, "expected a socket capacity warning")
+	assertTrue(helmet.id ~= nil, "expected helmet item")
+end)
+
+test("items_sockets_and_lifecycle", function()
+	api:newBuild({ name = "Item Edit", class = "Witch", level = 90 })
+	local body = api:itemsAddRare({
+		base = "Vaal Regalia",
+		name = "Socket Test",
+		mods = { "+100 to maximum Life" },
+		item_level = 86,
+		sockets = "B-B-B-B",
+	})
+	local sockets = api:itemsSetSockets({ item_id = body.id, sockets = "B-R-B-R-B" })
+	assertEqual(sockets.socket_count, 5)
+	local optimised = api:itemsOptimiseSockets({ item_id = body.id })
+	assertTrue(optimised.item.socket_count >= 5, "expected sockets to be preserved")
+	local enchanted = api:itemsSetEnchant({ item_id = body.id, line = "10% increased Energy Shield" })
+	assertTrue(enchanted.id == body.id, "expected the same item id")
+	local rawItems = api:itemsGet({ include_raw = true })
+	local raw
+	for _, item in ipairs(rawItems.items) do
+		if item.id == body.id then
+			raw = item.raw
+		end
+	end
+	assertTrue(raw and raw:find("10%% increased Energy Shield") ~= nil, "expected enchant line in raw item")
+	local influenced = api:itemsSetInfluences({ item_id = body.id, influences = { "shaper", "elder" } })
+	assertEqual(#influenced.influences, 2)
+	local okInfluence = pcall(function()
+		api:itemsSetInfluences({ item_id = body.id, influences = { "shaper", "elder", "crusader" } })
+	end)
+	assertTrue(not okInfluence, "expected more than two influences to fail")
+	local okMissingInfluence = pcall(function()
+		api:itemsSetInfluences({ item_id = body.id })
+	end)
+	assertTrue(not okMissingInfluence, "expected omitted influences to fail")
+	local corrupted = api:itemsCorrupt({ item_id = body.id, implicits = { "+1 to maximum Power Charges" } })
+	assertEqual(corrupted.corrupted, true)
+
+	local amulet = api:itemsAddRare({
+		base = "Marble Amulet",
+		name = "Anoint Test",
+		mods = { "+50 to maximum Life" },
+		item_level = 86,
+	})
+	local anointed = api:itemsAnoint({ item_id = amulet.id, notable = "Deep Wisdom" })
+	assertEqual(#anointed.anoints, 1)
+	local unanointed = api:itemsAnoint({ item_id = amulet.id, remove = true })
+	assertEqual(#unanointed.anoints, 0)
+
+	local flask = api:itemsAddUnique({ name = "Dying Sun" })
+	local toggled = api:itemsSetFlaskActive({ item_id = flask.id, active = true })
+	assertEqual(toggled.active, true)
+	local flaskSlot = toggled.slot
+	local flaskRaw
+	for _, candidate in ipairs(api:itemsGet({ include_raw = true }).items) do
+		if candidate.id == flask.id then
+			flaskRaw = candidate.raw
+		end
+	end
+	assertTrue(flaskRaw ~= nil, "expected flask raw text")
+	local updatedFlask = api:itemsUpdateRaw({ raw = flaskRaw, item_id = flask.id })
+	assertEqual(updatedFlask.id, flask.id)
+	assertTrue(flaskSlot ~= nil, "expected a flask slot")
+
+	local bubonic = api:itemsAddUnique({ name = "Bubonic Trail", variant = 4 })
+	local okTooManySockets = pcall(function()
+		api:itemsSetSockets({ item_id = bubonic.id, sockets = "B-B-B-B A-A" })
+	end)
+	assertTrue(not okTooManySockets, "expected abyssal sockets to reduce normal socket capacity")
+	local abyssalSockets = api:itemsSetSockets({ item_id = bubonic.id, sockets = "B-B A-A" })
+	assertEqual(abyssalSockets.socket_count, 4)
+end)
+
+test("rare_mod_search_and_structured_craft", function()
+	api:newBuild({ name = "Rare Craft", class = "Witch", level = 90 })
+	local prefixes = api:itemsSearchMods({ base = "Vaal Regalia", item_level = 86, type = "Prefix", query = "maximum Life", limit = 10 })
+	assertTrue(prefixes.total > 0, "expected a life prefix")
+	local suffixSearch = api:itemsSearchMods({ base = "Vaal Regalia", item_level = 86, type = "Suffix", query = "Fire Resistance", limit = 10 })
+	assertTrue(suffixSearch.total > 0, "expected a fire resistance suffix")
+	local prefix = prefixes.mods[1]
+	local suffix = suffixSearch.mods[1]
+	local validation = api:itemsValidateRare({
+		base = "Vaal Regalia",
+		item_level = 86,
+		prefixes = { { mod_id = prefix.mod_id, range = 0.8 } },
+		suffixes = { { mod_id = suffix.mod_id, range = 0.8 } },
+	})
+	assertTrue(validation.valid, "expected valid structured rare: " .. mcpJson.encode(validation.errors))
+	local item = api:itemsAddRare({
+		base = "Vaal Regalia",
+		name = "Structured Rare",
+		item_level = 86,
+		prefixes = { { mod_id = prefix.mod_id, range = 0.8 } },
+		suffixes = { { mod_id = suffix.mod_id, range = 0.8 } },
+	})
+	assertTrue(item.id ~= nil, "expected a crafted item")
+	local all = api:itemsGet({ include_raw = true })
+	local raw
+	for _, candidate in ipairs(all.items) do
+		if candidate.id == item.id then
+			raw = candidate.raw
+		end
+	end
+	assertTrue(raw and raw:find("Crafted: true", 1, true), "expected crafted item raw")
+	assertTrue(raw and raw:find("maximum Life", 1, true) ~= nil, "expected a prefix line")
+	local bad = api:itemsValidateRare({
+		base = "Vaal Regalia",
+		item_level = 1,
+		influences = { "shaper" },
+		prefixes = { { mod_id = prefix.mod_id } },
+	})
+	assertTrue(not bad.valid or #bad.warnings > 0, "expected item-level warning")
+	local templates = api:itemsSearchTemplates({ limit = 1 })
+	assertTrue(templates.total > 0, "expected bundled rare templates")
+	local templateItem = api:itemsAddTemplate({
+		name = templates.templates[1].name,
+		equip = false,
+		allow_requirement_violation = true,
+	})
+	assertTrue(templateItem.id ~= nil, "expected a template item")
+
+	local emptyStructured = api:itemsAddRare({
+		base = "Iron Hat",
+		name = "Empty Structured Arrays",
+		mods = { "+50 to maximum Life" },
+		prefixes = {},
+		suffixes = {},
+		influences = {},
+		equip = false,
+	})
+	local emptyRaw
+	for _, candidate in ipairs(api:itemsGet({ include_raw = true }).items) do
+		if candidate.id == emptyStructured.id then
+			emptyRaw = candidate.raw
+		end
+	end
+	assertTrue(emptyRaw and emptyRaw:find("maximum Life", 1, true) ~= nil, "empty structured arrays must not discard mods")
+	local influencedRaw = api:itemsAddRare({
+		base = "Iron Hat",
+		name = "Raw Influenced",
+		mods = { "+40 to maximum Life" },
+		influences = { "shaper" },
+		equip = false,
+	})
+	local influencedRawText
+	for _, candidate in ipairs(api:itemsGet({ include_raw = true }).items) do
+		if candidate.id == influencedRaw.id then
+			influencedRawText = candidate.raw
+		end
+	end
+	assertTrue(influencedRawText and influencedRawText:find("Shaper Item", 1, true) ~= nil, "raw mods should accept influences")
+	assertTrue(influencedRawText and influencedRawText:find("maximum Life", 1, true) ~= nil, "raw influenced item should keep mods")
+	local okMixed = pcall(function()
+		api:itemsAddRare({
+			base = "Iron Hat",
+			mods = { "+40 to maximum Life" },
+			prefixes = { { mod_id = prefix.mod_id } },
+		})
+	end)
+	assertTrue(not okMixed, "mixed raw and structured mods should fail")
+end)
+
+test("build_management_and_stats_search", function()
+	api:newBuild({ name = "Build Management", class = "Witch", level = 90 })
+	local fork = api:buildFork({ new_name = "P1 Fork", sub_path = "MCP-Tests", switch = false })
+	assertTrue(fork.to:find("MCP%-Tests") ~= nil, "expected fork in test subdirectory")
+	local list = api:buildList({ sub_path = "MCP-Tests", query = "P1 Fork" })
+	assertEqual(list.total, 1)
+	assertEqual(list.builds[1].name, "P1 Fork")
+	local loaded = api:buildLoad({ name = "P1 Fork", sub_path = "MCP-Tests" })
+	assertEqual(loaded.name, "P1 Fork")
+	local renamed = api:buildRename({ name = "P1 Fork", new_name = "P1 Renamed", sub_path = "MCP-Tests" })
+	assertTrue(renamed.to:find("P1 Renamed", 1, true) ~= nil, "expected renamed path")
+	local renamedByPath = api:buildRename({ path = renamed.to, new_name = "P1 Renamed Two" })
+	assertTrue(renamedByPath.to:find("MCP%-Tests") ~= nil, "renaming by path should stay in the source directory")
+	local second = api:buildFork({ name = "P1 Renamed Two", new_name = "P1 Delete", sub_path = "MCP-Tests", switch = false })
+	assertTrue(second.to:find("P1 Delete", 1, true) ~= nil, "expected second fork path")
+	local deleted = api:buildDelete({ name = "P1 Delete", sub_path = "MCP-Tests" })
+	assertEqual(deleted.deleted, true)
+	local afterDelete = api:buildList({ sub_path = "MCP-Tests", query = "P1 Delete" })
+	assertEqual(afterDelete.total, 0)
+
+	local snapshot = api:snapshot({ name = "p1-persistent", persistent = true })
+	assertEqual(snapshot.persistent, true)
+	local snapshots = api:snapshotList()
+	local found = false
+	for _, entry in ipairs(snapshots.snapshots) do
+		if entry.name == "p1-persistent" and entry.persistent then
+			found = true
+		end
+	end
+	assertTrue(found, "expected persistent snapshot in list")
+	api:restore({ name = "p1-persistent", persistent = true })
+	api:snapshotDelete({ name = "p1-persistent" })
+
+	api:snapshot({ name = "p1-memory-only" })
+	local memoryDeleted = api:snapshotDelete({ name = "p1-memory-only" })
+	assertEqual(memoryDeleted.memory, true)
+	assertEqual(memoryDeleted.persistent, false)
+
+	local stats = api:statsSearch({ query = "life", limit = 10 })
+	assertTrue(stats.total > 0, "expected life stat search results")
+	local calc = api:calcStats({ stats = { "life" } })
+	assertTrue(calc.requested.Life ~= nil, "expected case-insensitive stat resolution")
+	api:newBuild({ name = "Cleanup", class = "Witch", level = 90 })
+	for _, entry in ipairs(api:buildList({ sub_path = "MCP-Tests" }).builds) do
+		api:buildDelete({ name = entry.name, sub_path = "MCP-Tests" })
+	end
+end)
+
 test("invalid_requests", function()
 	local okNode = pcall(function()
 		api:passivesAllocate({ names = { "Definitely Not A Node" } })

@@ -56,8 +56,15 @@ The engine boots lazily on the first tool call. Startup is roughly 1.5 seconds a
 | `build_import` | Load XML, a PoB share code, or a file path. |
 | `build_export` | Export XML or a share code, optionally to a file. |
 | `build_state` | Compact build summary, stats, points, and warnings. |
-| `build_snapshot` | Save the current build XML under a name. |
-| `build_restore` | Restore a saved snapshot. |
+| `build_list` | List build files in the configured build directory. |
+| `build_load` | Load a build file from the build directory. |
+| `build_rename` | Rename a build file. |
+| `build_fork` | Fork the active build or a build file into a new file. |
+| `build_delete` | Delete a build file; the active build is protected. |
+| `build_snapshot` | Save the current build XML under a name, optionally persist it. |
+| `build_restore` | Restore a saved memory or persistent snapshot. |
+| `build_snapshot_list` | List in-memory and persistent snapshots. |
+| `build_snapshot_delete` | Delete a snapshot. |
 | `character_set` | Change level, class, or ascendancy. |
 | `build_set_constraints` | Set level, point budget, unique-item policy, and point enforcement. |
 | `build_validate` | Validate point budget, item requirements, sockets, resistances, and sustain. |
@@ -83,6 +90,11 @@ Node ids are specific to the current tree version. Search results include `path_
 | `skills_get` | List skill groups, gems, and the main group. |
 | `skills_add_group` | Add a socket group with level and quality per gem. |
 | `skills_remove_group` | Remove a group by index. |
+| `skills_update_group` | Edit label, slot, enabled state, count, Full DPS inclusion, and imbued support. |
+| `skills_set_slot` | Assign or clear a skill group slot. |
+| `skills_add_gem` | Add a gem at an optional position. |
+| `skills_remove_gem` | Remove a gem by index. |
+| `skills_set_gems` | Replace the full gem list for a group. |
 | `skills_set_main` | Select the main group and active skill part. |
 
 ### Items
@@ -93,11 +105,23 @@ Node ids are specific to the current tree version. Search results include `path_
 | `items_compare` | Compare a candidate item against the equipped item without mutating the build. |
 | `items_search_bases` | Search base item types for rare item creation. |
 | `items_add_raw` | Add an item from full PoB item text. |
+| `items_search_templates` | Search the bundled rare template database. |
 | `items_add_unique` | Add a unique by name, with optional variant and sockets. |
-| `items_add_rare` | Add a rare from a base and explicit modifier lines. |
+| `items_add_template` | Add a rare from the bundled template database. |
+| `items_search_mods` | Search the normal rare affix pool for a base and item level. |
+| `items_validate_rare` | Validate structured prefixes and suffixes before crafting. |
+| `items_add_rare` | Add a rare from explicit lines or structured prefixes/suffixes. |
 | `items_get` | List items and equipped slots. |
 | `items_equip` | Equip an item in a specific slot, including `Jewel <nodeId>`. |
 | `items_remove` | Remove an item. |
+| `items_set_sockets` | Set an item's socket colors and links. |
+| `items_optimise_sockets` | Rebuild sockets for the skill groups assigned to an item slot. |
+| `items_set_flask_active` | Set or toggle an equipped flask's active state. |
+| `items_anoint` | Add or remove an amulet anoint. |
+| `items_set_enchant` | Set or remove an enchantment line. |
+| `items_set_influences` | Set up to two influences or clear them. |
+| `items_corrupt` | Corrupt an item, optionally replacing corruption implicits. |
+| `items_update_raw` | Replace an existing item from full PoB item text. |
 
 ### Configuration and calculations
 
@@ -106,6 +130,7 @@ Node ids are specific to the current tree version. Search results include `path_
 | `config_search` | Search buffs, conditions, enemy settings, and custom modifiers. |
 | `config_get` | Values that differ from their defaults, including custom modifiers. |
 | `config_set` | Set config values and/or custom modifier text. |
+| `stats_search` | Search output stat keys by name, display label, or fuzzy text. |
 | `calc_stats` | Calculated stats; `all=true` returns the raw output table. |
 | `calc_what_if` | Evaluate node, item, flask, or condition changes without mutating the build. |
 | `calc_breakdown` | Detailed calculation breakdown for a stat. |
@@ -117,7 +142,7 @@ Node ids are specific to the current tree version. Search results include `path_
 2. `build_new` with class, ascendancy, and level; then `build_set_constraints` for level/budget/no-unique rules.
 3. `skills_search` and `skills_add_group` for the main skill and supports.
 4. `passives_search` and `passives_allocate` for the tree.
-5. `items_search_uniques`, `items_add_unique`, or `items_add_rare`.
+5. `items_search_templates`, `items_search_uniques`, `items_add_unique`, or `items_search_mods` + `items_validate_rare` + `items_add_rare`.
 6. `config_search` and `config_set` for buffs, conditions, and custom modifiers.
 7. `calc_stats`, `calc_breakdown`, and `calc_warnings` to inspect the result.
 8. `build_validate`, then `build_export` for XML or a share code.
@@ -137,6 +162,10 @@ This is a local stdio tool intended for a trusted MCP client. It can read and wr
 - Explicitly setting a level disables PoB's automatic level mode, so allocating passives will not overwrite the level.
 - Build share codes use zlib plus URL-safe Base64, handled inside the server.
 - Relative paths in `build_import` and `build_export` are resolved from the repository root.
+- Structured rare crafting mirrors the PoB UI affix pool, including influence context, duplicate-group exclusion, and Delve exclusion.
+- Socket capacity, link, and color issues are validation warnings rather than hard errors, matching PoB's ability to keep an invalid setup while editing.
+- `build_list` and build file management operate under the configured `buildPath`; persistent snapshots live under `<userPath>/MCP/Snapshots/`.
+- `stats_search` and `calc_stats` resolve common display labels such as `Hit DPS` or `Life` to output keys.
 - Ranked passive/item suggestions are planned next; `calc_what_if` already exposes the underlying misc calculator for safe comparisons.
 - The transport is isolated in `mcp/stdio.lua`, so an HTTP transport can be added without changing the tools.
 
@@ -149,7 +178,7 @@ luajit tools/pob-mcp/tests/run.lua
 luajit tools/pob-mcp/tests/stdio_test.lua
 ```
 
-The first suite checks build mutation, passives, masteries, jewels, items, config, calculations, snapshots, and build-code round-trips. The second suite drives the real MCP stdio protocol, including initialization, tool listing, tool calls, error responses, parse errors, and a build-code reload.
+The first suite checks build mutation, passives, masteries, jewels, items, skill editing, sockets, structured rares, item lifecycle, build file management, persistent snapshots, config, calculations, and build-code round-trips. The second suite drives the real MCP stdio protocol, including initialization, tool listing, tool calls, error responses, parse errors, and a build-code reload.
 
 ## Layout
 

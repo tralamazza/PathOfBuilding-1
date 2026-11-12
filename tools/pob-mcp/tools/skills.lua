@@ -33,8 +33,74 @@ local defs = {
 			slot = S.string("Item slot label, such as Helmet or Weapon 1"),
 			label = S.string("Skill group label"),
 			enabled = S.boolean("Whether the group is enabled"),
+			include_in_full_dps = S.boolean("Include in Full DPS"),
+			group_count = S.integer("Group count override", { minimum = 0 }),
 			set_main = S.boolean("Set this group as the main skill group"),
 		}, { "gems" }),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "skills_update_group",
+		description = "Update a skill group's label, enabled state, Full DPS settings, imbued support, or slot.",
+		inputSchema = S.object({
+			group = S.integer("Skill group index", { minimum = 1 }),
+			label = S.string("Group label"),
+			enabled = S.boolean("Whether the group is enabled"),
+			include_in_full_dps = S.boolean("Include in Full DPS"),
+			group_count = S.integer("Group count override", { minimum = 0 }),
+			imbued_support = S.string("Imbued support gem name; empty string clears"),
+			slot = S.string("Item slot label, or None"),
+			set_main = S.boolean("Set as main group"),
+		}, { "group" }),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "skills_set_slot",
+		description = "Assign a skill group to an item slot or clear it to None.",
+		inputSchema = S.object({
+			group = S.integer("Skill group index", { minimum = 1 }),
+			slot = S.string("Item slot label, or None"),
+		}, { "group" }),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "skills_add_gem",
+		description = "Add a gem to an existing skill group.",
+		inputSchema = S.object({
+			group = S.integer("Skill group index", { minimum = 1 }),
+			gem = S.object({
+				name = S.string("Gem name"),
+				level = S.integer("Gem level", { minimum = 1, maximum = 40 }),
+				quality = S.integer("Gem quality", { minimum = 0, maximum = 100 }),
+				enabled = S.boolean("Whether the gem is enabled"),
+				count = S.integer("Gem count", { minimum = 1 }),
+			}, { "name" }),
+			position = S.integer("Insert position", { minimum = 1 }),
+		}, { "group", "gem" }),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "skills_remove_gem",
+		description = "Remove a gem from a skill group by index.",
+		inputSchema = S.object({
+			group = S.integer("Skill group index", { minimum = 1 }),
+			gem = S.integer("Gem index", { minimum = 1 }),
+		}, { "group", "gem" }),
+		annotations = { destructiveHint = true },
+	},
+	{
+		name = "skills_set_gems",
+		description = "Replace all gems in a skill group.",
+		inputSchema = S.object({
+			group = S.integer("Skill group index", { minimum = 1 }),
+			gems = S.array(S.object({
+				name = S.string("Gem name"),
+				level = S.integer("Gem level", { minimum = 1, maximum = 40 }),
+				quality = S.integer("Gem quality", { minimum = 0, maximum = 100 }),
+				enabled = S.boolean("Whether the gem is enabled"),
+				count = S.integer("Gem count", { minimum = 1 }),
+			}, { "name" }), "Gems in socket order"),
+		}, { "group", "gems" }),
 		annotations = { destructiveHint = true },
 	},
 	{
@@ -68,6 +134,26 @@ end
 
 function handlers.skills_add_group(args, ctx)
 	return ctx.api():skillsAddGroup(args)
+end
+
+function handlers.skills_update_group(args, ctx)
+	return ctx.api():skillsUpdateGroup(args)
+end
+
+function handlers.skills_set_slot(args, ctx)
+	return ctx.api():skillsSetSlot(args)
+end
+
+function handlers.skills_add_gem(args, ctx)
+	return ctx.api():skillsAddGem(args)
+end
+
+function handlers.skills_remove_gem(args, ctx)
+	return ctx.api():skillsRemoveGem(args)
+end
+
+function handlers.skills_set_gems(args, ctx)
+	return ctx.api():skillsSetGems(args)
 end
 
 function handlers.skills_remove_group(args, ctx)
